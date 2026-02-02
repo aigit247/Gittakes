@@ -1,0 +1,951 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import boto3
+import pandas as pd
+
+
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def canonicalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return _clean_spaces(s)
+
+
+_LEGAL_SUFFIX_TOKENS = {"inc", "ltd", "llc", "plc", "as", "sa", "ag", "gmbh", "bv", "nv", "s"}
+
+
+def acronym(name: str) -> str:
+    toks = canonicalize_name(name).split()
+    while toks and toks[-1] in _LEGAL_SUFFIX_TOKENS:
+        toks.pop()
+    return "".join(t[0] for t in toks).upper() if toks else ""
+
+
+def normalize_country(country: Optional[str]) -> Optional[str]:
+    if not country:
+        return None
+    c = str(country).strip().upper()
+
+    if c in {"UNITED STATES", "U.S.", "U.S", "US", "USA"}:
+        return "US"
+    if c in {"UNITED KINGDOM", "GREAT BRITAIN", "GB", "UK"}:
+        return "UK"
+    if c in {"INDIA", "IN", "IND"}:
+        return "IN"
+
+    return c
+
+
+def _is_s3_uri(s: str) -> bool:
+    return isinstance(s, str) and s.lower().startswith("s3://")
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    u = urlparse(uri)
+    bucket = (u.netloc or "").strip()
+    key = (u.path or "").lstrip("/")
+    if not bucket:
+        raise ValueError(f"Invalid S3 URI (missing bucket): {uri}")
+    return bucket, key
+
+
+def _s3_join(bucket: str, key: str) -> str:
+    key = key.lstrip("/")
+    return f"s3://{bucket}/{key}" if key else f"s3://{bucket}"
+
+
+def _join_key(*parts: str) -> str:
+    out = []
+    for p in parts:
+        p = str(p or "").strip("/")
+        if p:
+            out.append(p)
+    return "/".join(out)
+
+
+@dataclass
+class ManifestDoc:
+    policy_id: str
+    source_file: Optional[str]
+    metadata: Dict[str, Any]
+
+
+class MetadataService:
+    """
+    S3-only, LIST + GET approach:
+      - CLIENT_MASTER_CSV can be:
+          * s3://bucket/path/to/file.csv (object)
+          * s3://bucket/path/to/folder (prefix)  -> we'll list and pick csv/xlsx/xls inside
+      - FAISS_INDEX_DIR is a prefix: s3://bucket/path/to/faiss_indices
+        Expected layout:
+          <faiss_prefix>/<category>/<client>/<country_or_subfolder>/manifest.json
+    """
+
+    def __init__(
+        self,
+        client_master_csv_path: str,
+        faiss_index_dir: str,
+        client_name_col: str = "parent_hq",
+        country_col: str = "country_code",
+        cid_col: str = "cid",
+        client_alias_map: Optional[Dict[str, str]] = None,
+        enable_llm_client_resolver: Optional[str] = None,
+        bedrock_region: Optional[str] = None,
+        llm_model_id: Optional[str] = None,
+        **_ignored_kwargs,
+    ):
+        if not _is_s3_uri(client_master_csv_path):
+            raise ValueError("CLIENT_MASTER_CSV must be s3://bucket/key OR s3://bucket/prefix")
+        if not _is_s3_uri(faiss_index_dir):
+            raise ValueError("FAISS_INDEX_DIR must be s3://bucket/prefix")
+
+        self.client_master_csv_path = client_master_csv_path.strip()
+        self.faiss_index_dir = faiss_index_dir.strip().rstrip("/")
+
+        self.client_name_col = client_name_col
+        self.country_col = country_col
+        self.cid_col = cid_col
+
+        alias_map = client_alias_map or {}
+        self._client_alias_map: Dict[str, str] = {canonicalize_name(k): v for k, v in alias_map.items()}
+
+        if enable_llm_client_resolver is None:
+            enable_llm_client_resolver = os.getenv("ENABLE_LLM_CLIENT_RESOLVER", "1")
+        self.enable_llm_client_resolver = str(enable_llm_client_resolver).strip().lower() in {"1", "true", "yes", "y"}
+
+        self.bedrock_region = bedrock_region or os.getenv("AWS_REGION", "us-east-1")
+        self.llm_model_id = llm_model_id or os.getenv(
+            "BEDROCK_LLM_MODEL",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        )
+
+        self.manifest_file_name = (os.getenv("MANIFEST_FILE_NAME") or "manifest.json").strip()
+        self.master_sheet = (os.getenv("CLIENT_MASTER_SHEET") or "").strip() or None
+
+        self._s3 = None
+        self.df: Optional[pd.DataFrame] = None
+        self._canon_choices: List[str] = []
+
+    # -------------------- S3 helpers --------------------
+    def _s3_client(self):
+        if self._s3 is None:
+            self._s3 = boto3.client("s3", region_name=self.bedrock_region)
+        return self._s3
+
+    def _list_keys(self, bucket: str, prefix: str) -> List[str]:
+        """List all object keys under prefix (uses paginator like your test code)."""
+        s3 = self._s3_client()
+        paginator = s3.get_paginator("list_objects_v2")
+        out: List[str] = []
+
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                k = obj.get("Key") or ""
+                if k and not k.endswith("/"):
+                    out.append(k)
+        return out
+
+    def _get_bytes(self, bucket: str, key: str) -> bytes:
+        s3 = self._s3_client()
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return obj["Body"].read()
+
+    def _resolve_master_object(self) -> tuple[str, str]:
+        """
+        Accepts:
+          - object key: s3://bucket/path/file.csv
+          - prefix:     s3://bucket/path/folder  (we list and pick one)
+        """
+        bucket, key = _parse_s3_uri(self.client_master_csv_path)
+
+        # direct object if it looks like a file
+        lk = key.lower()
+        if lk.endswith(".csv") or lk.endswith(".xlsx") or lk.endswith(".xls"):
+            return bucket, key
+
+        # treat as prefix
+        prefix = key.rstrip("/")
+        if prefix:
+            prefix += "/"
+
+        keys = self._list_keys(bucket, prefix)
+
+        # pick first matching master file (prefer csv, then xlsx/xls)
+        candidates_csv = [k for k in keys if k.lower().endswith(".csv")]
+        candidates_xlsx = [k for k in keys if k.lower().endswith(".xlsx") or k.lower().endswith(".xls")]
+
+        if candidates_csv:
+            return bucket, candidates_csv[0]
+        if candidates_xlsx:
+            return bucket, candidates_xlsx[0]
+
+        raise FileNotFoundError(
+            f"No master .csv/.xlsx found under prefix: s3://{bucket}/{prefix}"
+        )
+
+    # -------------------- loading --------------------
+    def ensure_loaded(self) -> None:
+        if self.df is None:
+            self._load_master_file()
+
+    def _load_master_file(self) -> None:
+        bucket, key = self._resolve_master_object()
+        data = self._get_bytes(bucket, key)
+
+        lk = key.lower()
+        if lk.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False)
+        elif lk.endswith(".xlsx") or lk.endswith(".xls"):
+            df = pd.read_excel(io.BytesIO(data), sheet_name=self.master_sheet, dtype=str, keep_default_na=False)
+        else:
+            raise ValueError(f"Unsupported master file extension: s3://{bucket}/{key}")
+
+        df.columns = [str(c).strip() for c in df.columns]
+
+        for c in [self.client_name_col, self.country_col, self.cid_col]:
+            if c not in df.columns:
+                raise ValueError(f"Master file missing column '{c}'. Found: {list(df.columns)[:80]}")
+
+        df["__canon_name"] = df[self.client_name_col].map(canonicalize_name)
+        df["__acronym"] = df[self.client_name_col].map(acronym)
+        df["__country"] = df[self.country_col].map(normalize_country)
+
+        self.df = df
+        self._canon_choices = df["__canon_name"].tolist()
+
+    # -------------------- alias map --------------------
+    def _apply_client_alias_map(self, client_value: str) -> str:
+        cm = canonicalize_name(client_value)
+        return self._client_alias_map.get(cm, client_value)
+
+    # -------------------- resolve CSV row (same logic as your original) --------------------
+    def _resolve_client_row(self, client_value: str, country: Optional[str]) -> Optional[pd.Series]:
+        assert self.df is not None
+
+        cm = _clean_spaces(client_value)
+        if not cm:
+            return None
+
+        cm_canon = canonicalize_name(cm)
+        cm_acr = cm.strip().upper()
+        country_norm = normalize_country(country)
+
+        df = self.df
+
+        def pick_best(candidates_df: pd.DataFrame) -> Optional[pd.Series]:
+            if candidates_df.empty:
+                return None
+            if country_norm:
+                c2 = candidates_df[candidates_df["__country"] == country_norm]
+                if not c2.empty:
+                    return c2.iloc[0]
+            return candidates_df.iloc[0]
+
+        exact = df[df["__canon_name"] == cm_canon]
+        r = pick_best(exact)
+        if r is not None:
+            return r
+
+        acr = df[df["__acronym"] == cm_acr]
+        r = pick_best(acr)
+        if r is not None:
+            return r
+
+        if cm_canon:
+            sub = df[df["__canon_name"].str.contains(re.escape(cm_canon), na=False)]
+            r = pick_best(sub)
+            if r is not None:
+                return r
+
+        # simple fuzzy fallback
+        try:
+            from rapidfuzz import process, fuzz  # type: ignore
+            m = process.extract(cm_canon, self._canon_choices, scorer=fuzz.token_set_ratio, limit=8)
+            if m:
+                best_name, best_score, best_idx = m[0]
+                if float(best_score) >= 70:
+                    return df.iloc[int(best_idx)]
+        except Exception:
+            pass
+
+        return None
+
+    # -------------------- Manifest reading (LIST + GET) --------------------
+    def _client_folder_matches(self, folder: str, client_name: str) -> bool:
+        a = canonicalize_name(folder)
+        b = canonicalize_name(client_name)
+        return a == b or a in b or b in a
+
+    def _read_manifest_docs_from_s3(self, bucket: str, manifest_key: str) -> List[ManifestDoc]:
+        try:
+            raw = self._get_bytes(bucket, manifest_key)
+            text = raw.decode("utf-8-sig", errors="replace")
+            data = json.loads(text)
+        except Exception:
+            return []
+
+        docs_out: List[ManifestDoc] = []
+        for d in data.get("docs", []) or []:
+            policy_id = str(d.get("policy_id") or "").strip()
+            source_file = d.get("source_file")
+
+            md = d.get("metadata") or {}
+            if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                md = md["metadataAttributes"]
+            if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                md = md["metadataAtrributes"]
+
+            if isinstance(md, dict):
+                docs_out.append(ManifestDoc(policy_id=policy_id, source_file=source_file, metadata=md))
+
+        return docs_out
+
+    def _find_manifest_keys(
+        self,
+        bucket: str,
+        base_prefix: str,
+        category: str,
+        client_resolved: str,
+        country: Optional[str],
+    ) -> List[str]:
+        """
+        Finds manifest.json keys by LISTing under:
+          <base_prefix>/<category>/
+        then filtering for client folder + subfolder match.
+        """
+        cat_prefix = _join_key(base_prefix, category) + "/"
+        all_keys = self._list_keys(bucket, cat_prefix)
+
+        ctry = normalize_country(country)
+
+        # filter by client folder match + manifest name
+        candidates = []
+        for k in all_keys:
+            if not k.endswith("/" + self.manifest_file_name):
+                continue
+            # expecting: base/category/client/sub/manifest.json
+            parts = k[len(cat_prefix):].split("/")
+            if len(parts) < 3:
+                continue
+            client_folder = parts[0]
+            subfolder = parts[1]
+
+            if not self._client_folder_matches(client_folder, client_resolved):
+                continue
+
+            if ctry:
+                if normalize_country(subfolder) != ctry:
+                    continue
+            else:
+                # no country -> only Ultimate Parent / Corporate Family
+                sub_c = canonicalize_name(subfolder)
+                if sub_c not in {canonicalize_name("Ultimate Parent"), canonicalize_name("Corporate Family")}:
+                    continue
+
+            candidates.append(k)
+
+        return candidates
+
+    # -----------------------------
+    # PUBLIC: Structured lookup
+    # -----------------------------
+    def lookup_structured(
+        self,
+        client: str,
+        country: Optional[str] = None,
+        category: Optional[str] = "finance",
+        include_manifest: bool = True,
+        max_docs_per_manifest: int = 200,
+    ) -> Dict[str, Any]:
+        self.ensure_loaded()
+        assert self.df is not None
+
+        client_in = (client or "").strip()
+        if not client_in:
+            return {"error": "client is required"}
+
+        cat = (category or "finance").strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = "finance"
+
+        ctry = normalize_country(country)
+        client_mapped = self._apply_client_alias_map(client_in)
+
+        row = self._resolve_client_row(client_mapped, ctry)
+        if row is None:
+            return {
+                "client_input": client_in,
+                "client_resolved": None,
+                "category": cat,
+                "country": ctry,
+                "capid": None,
+                "capids_by_country": [],
+                "manifest": {"manifests_found": 0, "manifests": [], "metadata_keys": [], "docs_truncated": False},
+                "error": f"'{client_mapped}' was not found in master file.",
+            }
+
+        client_resolved = str(row[self.client_name_col]).strip()
+        capid = str(row[self.cid_col]).strip()
+
+        manifest_payload: Dict[str, Any] = {
+            "manifests_found": 0,
+            "manifests": [],
+            "metadata_keys": [],
+            "docs_truncated": False,
+        }
+
+        if include_manifest:
+            bucket, base_prefix = _parse_s3_uri(self.faiss_index_dir)
+            base_prefix = base_prefix.rstrip("/")
+
+            manifest_keys = self._find_manifest_keys(bucket, base_prefix, cat, client_resolved, ctry)
+
+            all_keys = set()
+            for mk in manifest_keys[:10]:
+                docs = self._read_manifest_docs_from_s3(bucket, mk)
+
+                truncated = False
+                if len(docs) > max_docs_per_manifest:
+                    docs = docs[:max_docs_per_manifest]
+                    truncated = True
+                    manifest_payload["docs_truncated"] = True
+
+                docs_out = []
+                for d in docs:
+                    for k in (d.metadata or {}).keys():
+                        all_keys.add(str(k))
+                    docs_out.append({"policy_id": d.policy_id, "source_file": d.source_file, "metadata": d.metadata})
+
+                folder = "/".join(mk.split("/")[:-1])
+                manifest_payload["manifests"].append(
+                    {
+                        "folder": _s3_join(bucket, folder),
+                        "manifest_path": _s3_join(bucket, mk),
+                        "exists": True,
+                        "docs_count_returned": len(docs_out),
+                        "docs_truncated": truncated,
+                        "docs": docs_out,
+                    }
+                )
+
+            manifest_payload["manifests_found"] = len(manifest_payload["manifests"])
+            manifest_payload["metadata_keys"] = sorted(all_keys)
+
+        return {
+            "client_input": client_in,
+            "client_resolved": client_resolved,
+            "category": cat,
+            "country": ctry,
+            "capid": capid if ctry else None,
+            "capids_by_country": [],
+            "manifest": manifest_payload,
+            "error": None,
+        }
+
+
+
+____
+
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+from langchain_aws import BedrockEmbeddings
+
+from services.metadata_service import MetadataService, canonicalize_name, normalize_country
+
+try:
+    from langchain_community.vectorstores import FAISS  # type: ignore
+except Exception:
+    from langchain.vectorstores import FAISS  # type: ignore
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    u = urlparse(uri)
+    bucket = (u.netloc or "").strip()
+    key = (u.path or "").lstrip("/")
+    if not bucket:
+        raise ValueError(f"Invalid S3 URI (missing bucket): {uri}")
+    return bucket, key
+
+
+def _join_key(*parts: str) -> str:
+    out = []
+    for p in parts:
+        p = str(p or "").strip("/")
+        if p:
+            out.append(p)
+    return "/".join(out)
+
+
+@dataclass
+class RagChunk:
+    rank: int
+    score: float
+    text: str
+    metadata: Dict[str, Any]
+
+
+class RagSearchService:
+    def __init__(
+        self,
+        metadata_svc: MetadataService,
+        faiss_index_dir: str,  # s3://bucket/prefix
+        bedrock_region: str = "us-east-1",
+        embedding_model_id: Optional[str] = None,
+        default_top_k: int = 8,
+        default_category: str = "finance",
+        mmr_fetch_k: Optional[int] = None,
+        mmr_lambda_mult: float = 0.5,
+        faiss_cache_dir: Optional[str] = None,
+    ):
+        load_dotenv()
+
+        faiss_index_dir = (faiss_index_dir or "").strip()
+        if not faiss_index_dir.lower().startswith("s3://"):
+            raise ValueError(f"FAISS_INDEX_DIR must be an S3 prefix like s3://bucket/path, got: {faiss_index_dir!r}")
+
+        self.meta = metadata_svc
+        self.bedrock_region = bedrock_region
+
+        self.bucket, self.base_prefix = _parse_s3_uri(faiss_index_dir.rstrip("/"))
+        self.base_prefix = self.base_prefix.rstrip("/")
+
+        self.embedding_model_id = embedding_model_id or os.getenv(
+            "BEDROCK_EMBEDDING_MODEL",
+            "amazon.titan-embed-text-v1",
+        )
+
+        self.default_top_k = int(default_top_k)
+        self.default_category = (default_category or "finance").strip().lower()
+        if self.default_category not in {"finance", "legal"}:
+            self.default_category = "finance"
+
+        self.mmr_fetch_k = int(mmr_fetch_k) if mmr_fetch_k is not None else max(self.default_top_k * 5, 25)
+        self.mmr_lambda_mult = float(mmr_lambda_mult)
+
+        self.faiss_cache_dir = (faiss_cache_dir or os.getenv("FAISS_INDEX_DIR_LOCAL") or "/tmp/faiss_indices").strip()
+        if not self.faiss_cache_dir:
+            self.faiss_cache_dir = "/tmp/faiss_indices"
+
+        # optional preferred names (if you know them)
+        self.faiss_file_name = (os.getenv("FAISS_FILE_NAME") or "").strip() or None
+        self.faiss_pkl_name = (os.getenv("FAISS_PKL_NAME") or "").strip() or None
+
+        self._s3 = None
+        self._embeddings = None
+
+    # ---------------- S3 helpers ----------------
+    def _s3_client(self):
+        if self._s3 is None:
+            self._s3 = boto3.client("s3", region_name=self.bedrock_region)
+        return self._s3
+
+    def _list_keys(self, prefix: str) -> List[str]:
+        s3 = self._s3_client()
+        paginator = s3.get_paginator("list_objects_v2")
+        out: List[str] = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                k = obj.get("Key") or ""
+                if k and not k.endswith("/"):
+                    out.append(k)
+        return out
+
+    def _download(self, key: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        self._s3_client().download_file(self.bucket, key, str(dest))
+
+    # ---------------- Embeddings ----------------
+    def _emb(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        brt = boto3.client("bedrock-runtime", region_name=self.bedrock_region)
+        self._embeddings = BedrockEmbeddings(model_id=self.embedding_model_id, client=brt)
+        return self._embeddings
+
+    # ---------------- Find matching S3 "folders" by listing ----------------
+    def _client_folder_matches(self, folder: str, client_name: str) -> bool:
+        a = canonicalize_name(folder)
+        b = canonicalize_name(client_name)
+        return a == b or a in b or b in a
+
+    def _find_client_folders(self, category: str, client_resolved: str) -> List[str]:
+        """
+        List under: <base_prefix>/<category>/ and return client folder names.
+        """
+        cat_prefix = _join_key(self.base_prefix, category) + "/"
+        keys = self._list_keys(cat_prefix)
+
+        # collect unique client folders from keys
+        client_folders = []
+        seen = set()
+        for k in keys:
+            rest = k[len(cat_prefix):]
+            parts = rest.split("/")
+            if len(parts) < 2:
+                continue
+            cf = parts[0]
+            if cf in seen:
+                continue
+            seen.add(cf)
+            if self._client_folder_matches(cf, client_resolved):
+                client_folders.append(cf)
+
+        return client_folders
+
+    def _find_index_subfolders(self, category: str, client_folder: str, country: Optional[str]) -> List[str]:
+        """
+        Return subfolder names under: <base_prefix>/<category>/<client_folder>/
+        - if country provided -> only matching country folders
+        - else -> Ultimate Parent / Corporate Family
+        """
+        client_prefix = _join_key(self.base_prefix, category, client_folder) + "/"
+        keys = self._list_keys(client_prefix)
+
+        subs = []
+        seen = set()
+        for k in keys:
+            rest = k[len(client_prefix):]
+            parts = rest.split("/")
+            if len(parts) < 2:
+                continue
+            sub = parts[0]
+            if sub in seen:
+                continue
+            seen.add(sub)
+            subs.append(sub)
+
+        ctry = normalize_country(country)
+        if ctry:
+            return [s for s in subs if normalize_country(s) == ctry]
+
+        want = {canonicalize_name("Ultimate Parent"), canonicalize_name("Corporate Family")}
+        return [s for s in subs if canonicalize_name(s) in want]
+
+    def _pick_faiss_files_in_folder(self, folder_prefix: str) -> tuple[str, str]:
+        """
+        folder_prefix: <base_prefix>/<category>/<client>/<subfolder>/
+        If FAISS_FILE_NAME/FAISS_PKL_NAME provided, use them.
+        Else list and auto-detect first .faiss and first .pkl.
+        Returns (faiss_key, pkl_key)
+        """
+        folder_prefix = folder_prefix.rstrip("/") + "/"
+        keys = self._list_keys(folder_prefix)
+
+        if self.faiss_file_name and self.faiss_pkl_name:
+            faiss_key = _join_key(folder_prefix, self.faiss_file_name)
+            pkl_key = _join_key(folder_prefix, self.faiss_pkl_name)
+            return faiss_key, pkl_key
+
+        faiss_candidates = [k for k in keys if k.lower().endswith(".faiss")]
+        pkl_candidates = [k for k in keys if k.lower().endswith(".pkl")]
+
+        if not faiss_candidates or not pkl_candidates:
+            raise FileNotFoundError(
+                f"Could not find both .faiss and .pkl under s3://{self.bucket}/{folder_prefix}. "
+                f"Found faiss={len(faiss_candidates)} pkl={len(pkl_candidates)}"
+            )
+
+        return faiss_candidates[0], pkl_candidates[0]
+
+    # ---------------- FAISS ----------------
+    def _load_faiss_store(self, folder: Path):
+        try:
+            return FAISS.load_local(str(folder), self._emb(), allow_dangerous_deserialization=True)
+        except TypeError:
+            return FAISS.load_local(str(folder), self._emb())
+
+    def _json_sanitize(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): self._json_sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_sanitize(v) for v in obj]
+        return str(obj)
+
+    # ---------------- Public ----------------
+    def retrieve_chunks_structured(
+        self,
+        query: str,
+        client: str,
+        country: Optional[str] = None,
+        category: Optional[str] = "finance",
+        top_k: Optional[int] = None,
+        include_manifest: bool = True,
+        max_docs_per_manifest: int = 100000,
+    ) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("query is required")
+
+        client_in = (client or "").strip()
+        if not client_in:
+            raise ValueError("client is required")
+
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = self.default_category
+
+        ctry = normalize_country(country)
+        k = int(top_k) if top_k else self.default_top_k
+
+        # Resolve client via master file
+        self.meta.ensure_loaded()
+        client_mapped = self.meta._apply_client_alias_map(client_in)
+        row = self.meta._resolve_client_row(client_mapped, country=ctry)
+        client_resolved = str(row[self.meta.client_name_col]).strip() if row is not None else client_mapped
+
+        # Find matching client folders in S3
+        client_folders = self._find_client_folders(cat, client_resolved)
+        if not client_folders:
+            raise FileNotFoundError(
+                f"No client folder found in S3 under s3://{self.bucket}/{self.base_prefix}/{cat}/ for client='{client_resolved}'"
+            )
+
+        # Try each matching client folder until we can load at least one index
+        local_index_folders: List[Path] = []
+        for client_folder in client_folders:
+            subfolders = self._find_index_subfolders(cat, client_folder, ctry)
+            for sub in subfolders:
+                folder_prefix = _join_key(self.base_prefix, cat, client_folder, sub) + "/"
+
+                # pick faiss + pkl keys
+                faiss_key, pkl_key = self._pick_faiss_files_in_folder(folder_prefix)
+
+                # download to local cache
+                local_folder = Path(self.faiss_cache_dir) / self.base_prefix / cat / client_folder / sub
+                self._download(faiss_key, local_folder / Path(faiss_key).name)
+                self._download(pkl_key, local_folder / Path(pkl_key).name)
+
+                local_index_folders.append(local_folder)
+
+            if local_index_folders:
+                break
+
+        if not local_index_folders:
+            raise FileNotFoundError(
+                f"Found client folders but could not find usable FAISS indexes for client='{client_resolved}', "
+                f"category='{cat}', country='{ctry}'."
+            )
+
+        # manifest from metadata service (it also uses LIST+GET)
+        manifest_payload: Dict[str, Any] = {}
+        if include_manifest:
+            m = self.meta.lookup_structured(
+                client=client_in,
+                country=country,
+                category=cat,
+                include_manifest=True,
+                max_docs_per_manifest=max_docs_per_manifest,
+            )
+            manifest_payload = m.get("manifest") or {}
+
+        merged: List[RagChunk] = []
+
+        for folder in local_index_folders:
+            store = self._load_faiss_store(folder)
+
+            mmr_docs = store.max_marginal_relevance_search(
+                q, k=k, fetch_k=self.mmr_fetch_k, lambda_mult=self.mmr_lambda_mult
+            )
+            scored = store.similarity_search_with_score(q, k=self.mmr_fetch_k)
+
+            def _doc_key(d) -> str:
+                md = getattr(d, "metadata", {}) or {}
+                md_items = sorted((str(k2), str(v2)) for k2, v2 in md.items())
+                return (getattr(d, "page_content", "") or "") + "||" + "||".join([f"{k2}={v2}" for k2, v2 in md_items])
+
+            score_map: Dict[str, float] = {}
+            for d, s in scored:
+                key = _doc_key(d)
+                if key not in score_map or float(s) < score_map[key]:
+                    score_map[key] = float(s)
+
+            for d in mmr_docs:
+                text = (d.page_content or "").strip()
+                md = dict(d.metadata or {})
+                md.setdefault("_index_folder", str(folder))
+                sc = score_map.get(_doc_key(d), 0.0)
+                merged.append(RagChunk(rank=0, score=float(sc), text=text, metadata=md))
+
+        merged.sort(key=lambda x: x.score)
+
+        # de-dupe
+        dedup: List[RagChunk] = []
+        seen = set()
+        for ch in merged:
+            sig = (ch.text[:400], str(ch.metadata.get("policy_id") or ""), str(ch.metadata.get("_index_folder") or ""))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            dedup.append(ch)
+
+        top = dedup[:k]
+
+        return {
+            "top_chunks": [{"text": ch.text, "metadata": self._json_sanitize(ch.metadata)} for ch in top],
+            "client_resolved": client_resolved,
+            "country": ctry,
+            "category": cat,
+            "manifest": manifest_payload,
+        }
+
+
+___
+
+
+import os
+from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from services.metadata_service import MetadataService
+from services.rag_search_service import RagSearchService
+
+load_dotenv()
+
+app = FastAPI(title="Structured Metadata + RAG Retrieval API", version="3.0.0")
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+CLIENT_MASTER_CSV = (os.getenv("CLIENT_MASTER_CSV") or "").strip()
+FAISS_INDEX_DIR = (os.getenv("FAISS_INDEX_DIR") or "").strip()
+
+if not CLIENT_MASTER_CSV.lower().startswith("s3://"):
+    raise RuntimeError(f"CLIENT_MASTER_CSV must be s3://..., got: {CLIENT_MASTER_CSV!r}")
+if not FAISS_INDEX_DIR.lower().startswith("s3://"):
+    raise RuntimeError(f"FAISS_INDEX_DIR must be s3://..., got: {FAISS_INDEX_DIR!r}")
+
+svc = MetadataService(
+    client_master_csv_path=CLIENT_MASTER_CSV,  # can be object OR prefix (we list+pick file)
+    faiss_index_dir=FAISS_INDEX_DIR,          # prefix
+    client_name_col=os.getenv("CLIENT_NAME_COL", "parent_hq"),
+    country_col=os.getenv("COUNTRY_COL", "country_code"),
+    cid_col=os.getenv("CID_COL", "cid"),
+    enable_llm_client_resolver=os.getenv("ENABLE_LLM_CLIENT_RESOLVER", "1"),
+    bedrock_region=AWS_REGION,
+    llm_model_id=os.getenv("BEDROCK_LLM_MODEL"),
+)
+
+rag = RagSearchService(
+    metadata_svc=svc,
+    faiss_index_dir=FAISS_INDEX_DIR,  # prefix
+    bedrock_region=AWS_REGION,
+    embedding_model_id=os.getenv("BEDROCK_EMBEDDING_MODEL"),
+    default_top_k=int(os.getenv("RAG_TOP_K", "8")),
+    default_category=os.getenv("RAG_DEFAULT_CATEGORY", "finance"),
+    faiss_cache_dir=os.getenv("FAISS_INDEX_DIR_LOCAL", "/tmp/faiss_indices"),
+)
+
+
+class MetadataLookupRequest(BaseModel):
+    client: str
+    country: Optional[str] = None
+    category: str = "finance"
+    include_manifest: bool = True
+    max_docs_per_manifest: int = 200
+
+
+class RagSearchRequest(BaseModel):
+    query: str
+    client: str
+    country: Optional[str] = None
+    category: str = "finance"
+    top_k: Optional[int] = None
+    include_manifest: bool = True
+    max_docs_per_manifest: int = 100000
+
+
+@app.post("/api/metadata/lookup", response_model=Dict[str, Any], tags=["metadata"])
+def metadata_lookup(payload: MetadataLookupRequest):
+    client = payload.client.strip()
+    if not client:
+        raise HTTPException(status_code=400, detail="client is required")
+
+    try:
+        return svc.lookup_structured(
+            client=client,
+            country=payload.country,
+            category=payload.category,
+            include_manifest=payload.include_manifest,
+            max_docs_per_manifest=payload.max_docs_per_manifest,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"metadata lookup failed: {e}")
+
+
+@app.post("/api/rag/search", response_model=Dict[str, Any], tags=["rag"])
+def rag_search(payload: RagSearchRequest):
+    query = payload.query.strip()
+    client = payload.client.strip()
+
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    if not client:
+        raise HTTPException(status_code=400, detail="client is required")
+
+    try:
+        return rag.retrieve_chunks_structured(
+            query=query,
+            client=client,
+            country=payload.country,
+            category=payload.category,
+            top_k=payload.top_k,
+            include_manifest=payload.include_manifest,
+            max_docs_per_manifest=payload.max_docs_per_manifest,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rag retrieval failed: {e}")
+
+
+@app.on_event("startup")
+def startup():
+    try:
+        svc.ensure_loaded()
+    except Exception as e:
+        print(f"[WARN] startup preload failed: {e}")
+
+
+@app.get("/health", tags=["ops"])
+def health():
+    return {"status": "ok"}
+
+
+
+
+
+
+
+
