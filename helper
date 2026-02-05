@@ -1,15 +1,3 @@
-# ONE-CELL deterministic debug for:
-# A) per-field retrieval union
-# B) one Claude call per client
-# C) prune using normalized substring
-# D) blanks for missing fields
-#
-# Prereqs:
-# - config.json present with evidence_jsonl_path, faiss_index_path, aws_region
-# - env vars set:
-#   BEDROCK_EMBED_MODEL_ID (Titan v2 embed)
-#   BEDROCK_LLM_MODEL_ID   (Claude Sonnet 4.5 model id / inference profile id)
-
 import json, os, re, time
 from pathlib import Path
 
