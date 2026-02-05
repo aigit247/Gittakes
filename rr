@@ -1,0 +1,170 @@
+import json
+import time
+from pathlib import Path
+from typing import List, Optional, Dict
+
+import boto3
+
+
+def load_config(path: str = "config.json") -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def s3_list_keys(s3, bucket: str, prefix: str) -> List[str]:
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    keys.sort()
+    return keys
+
+
+def list_pdfs(s3, bucket: str, prefix: str) -> List[str]:
+    return [k for k in s3_list_keys(s3, bucket, prefix) if k.lower().endswith(".pdf")]
+
+
+def parse_company_client(key: str, input_prefix: str) -> Optional[Dict[str, str]]:
+    """
+    Expects: <input_prefix>/<Company>/<Client>/<file>.pdf
+    Example: data/Koch/client1/c1.pdf
+
+    Returns {"company":..., "client":..., "filename":...} or None if not matching.
+    """
+    if not key.startswith(input_prefix):
+        return None
+
+    rel = key[len(input_prefix):].lstrip("/")  # remove prefix
+    parts = rel.split("/")
+
+    if len(parts) < 3:
+        return None
+
+    company = parts[0].strip()
+    client = parts[1].strip()
+    filename = parts[-1].strip()
+    if not company or not client or not filename.lower().endswith(".pdf"):
+        return None
+
+    return {"company": company, "client": client, "filename": filename}
+
+
+def start_job(textract, bucket: str, key: str, feature_types: List[str]) -> str:
+    resp = textract.start_document_analysis(
+        DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+        FeatureTypes=feature_types
+    )
+    return resp["JobId"]
+
+
+def fetch_all_pages(textract, job_id: str) -> dict:
+    blocks = []
+    next_token: Optional[str] = None
+
+    while True:
+        args = {"JobId": job_id}
+        if next_token:
+            args["NextToken"] = next_token
+
+        resp = textract.get_document_analysis(**args)
+        blocks.extend(resp.get("Blocks", []))
+
+        next_token = resp.get("NextToken")
+        if not next_token:
+            return {
+                "JobStatus": resp.get("JobStatus"),
+                "StatusMessage": resp.get("StatusMessage"),
+                "DocumentMetadata": resp.get("DocumentMetadata"),
+                "Blocks": blocks
+            }
+
+
+def wait_for_job(textract, job_id: str, poll_seconds: float, max_minutes: float) -> dict:
+    deadline = time.time() + max_minutes * 60.0
+
+    while True:
+        resp = textract.get_document_analysis(JobId=job_id)
+        status = resp.get("JobStatus")
+
+        if status in ("SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"):
+            # For FAILED/PARTIAL_SUCCESS we still fetch what is available
+            return fetch_all_pages(textract, job_id)
+
+        if time.time() > deadline:
+            raise TimeoutError(f"Timed out after {max_minutes} minutes (JobId={job_id})")
+
+        time.sleep(poll_seconds)
+
+
+def allowed_company(company: str, include: List[str], exclude: List[str]) -> bool:
+    if include and company not in include:
+        return False
+    if exclude and company in exclude:
+        return False
+    return True
+
+
+def main():
+    cfg = load_config()
+
+    region = cfg.get("aws_region", "us-east-1")
+    bucket = cfg["s3_bucket"]
+    input_prefix = cfg.get("s3_input_prefix", "data/").rstrip("/") + "/"
+
+    out_root = Path(cfg.get("local_textract_json_root", "textract_json"))
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    feature_types = cfg.get("feature_types", ["TABLES"])
+    poll_seconds = float(cfg.get("poll_seconds", 3))
+    max_minutes = float(cfg.get("max_poll_minutes", 30))
+
+    include = cfg.get("include_companies", []) or []
+    exclude = cfg.get("exclude_companies", []) or []
+    skip_if_exists = bool(cfg.get("skip_if_exists", True))
+
+    session = boto3.Session(region_name=region)
+    s3 = session.client("s3")
+    textract = session.client("textract")
+
+    pdf_keys = list_pdfs(s3, bucket, input_prefix)
+    if not pdf_keys:
+        print(f"No PDFs found under s3://{bucket}/{input_prefix}")
+        return
+
+    print(f"Found {len(pdf_keys)} PDFs under s3://{bucket}/{input_prefix}")
+
+    for key in pdf_keys:
+        info = parse_company_client(key, input_prefix)
+        if not info:
+            continue
+
+        company = info["company"]
+        client = info["client"]
+        filename = info["filename"]
+        stem = Path(filename).stem
+
+        if not allowed_company(company, include, exclude):
+            continue
+
+        out_dir = out_root / company / client
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{stem}.json"
+
+        if skip_if_exists and out_path.exists():
+            print(f"[skip] {company}/{client} -> {filename}")
+            continue
+
+        print(f"[textract] {company}/{client} -> {filename}")
+        try:
+            job_id = start_job(textract, bucket, key, feature_types)
+            result = wait_for_job(textract, job_id, poll_seconds, max_minutes)
+
+            out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            print(f"  saved: {out_path}")
+
+        except Exception as e:
+            print(f"  ERROR: s3://{bucket}/{key} -> {e}")
+
+
+if __name__ == "__main__":
+    main()
