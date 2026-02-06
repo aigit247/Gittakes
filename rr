@@ -1,0 +1,380 @@
+# Query-based RAG (per-client FAISS) + TABLE expansion to whole-table blocks (deterministic)
+# - User query -> embed -> FAISS topK
+# - If any TABLE_ROW is retrieved, expand to ALL rows of that table_id (within caps)
+# - Collapse rows into TABLE_BLOCK chunks for the LLM (so tables aren't row-wise in prompt)
+#
+# Prereqs:
+# - per-client stores exist:
+#     index/by_client/<company>/<client>/faiss.index
+#     index/by_client/<company>/<client>/evidence.jsonl
+# - env vars:
+#     BEDROCK_EMBED_MODEL_ID
+#     BEDROCK_LLM_MODEL_ID
+
+import json, os, re
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, Any, List, Tuple, Optional
+
+import boto3
+import faiss
+import numpy as np
+
+# ----------------- CONFIG (EDIT) -----------------
+AWS_REGION  = os.getenv("AWS_REGION", "us-east-1")
+FAISS_ROOT  = Path("index/by_client")  # change if needed
+
+COMPANY  = "Koch"       # <-- set
+CLIENT   = "client1"    # <-- set
+QUESTION = "What is the TOUR CODE?"  # <-- set
+
+TOP_K = 12                 # initial nearest neighbors
+EXTRA_K_FOR_TABLES = 50    # extra retrieval depth to increase chance of catching correct table row(s)
+
+# Table expansion/collapse caps (tune these first if answers are missing)
+MAX_TABLES_IN_CONTEXT = 6           # maximum distinct tables to include per query
+MAX_ROWS_PER_TABLE_BLOCK = 500      # None to try "all rows", but keep this to avoid huge prompts
+MAX_CHARS_PER_TABLE_BLOCK = 25000   # safety split if a table block becomes too large
+MAX_CONTEXT_CHARS = 120000          # hard cap for prompt context
+
+# LLM determinism
+TEMPERATURE = 0
+MAX_TOKENS  = 900
+
+# ------------------------------------------------
+
+EMBED_MODEL = os.environ.get("BEDROCK_EMBED_MODEL_ID")
+LLM_MODEL   = os.environ.get("BEDROCK_LLM_MODEL_ID")
+if not EMBED_MODEL or not LLM_MODEL:
+    raise RuntimeError("Set env vars BEDROCK_EMBED_MODEL_ID and BEDROCK_LLM_MODEL_ID")
+
+bedrock = boto3.Session(region_name=AWS_REGION).client("bedrock-runtime")
+
+
+# ----------------- Bedrock helpers -----------------
+def embed_query(q: str) -> np.ndarray:
+    resp = bedrock.invoke_model(
+        modelId=EMBED_MODEL,
+        body=json.dumps({"inputText": q}),
+        accept="application/json",
+        contentType="application/json",
+    )
+    v = np.array(json.loads(resp["body"].read())["embedding"], dtype="float32")
+    n = float(np.linalg.norm(v))
+    if n > 0:
+        v = v / n
+    return v.reshape(1, -1)
+
+def _extract_text_any(raw: dict) -> str:
+    if isinstance(raw, dict):
+        if "content" in raw and isinstance(raw["content"], list) and raw["content"]:
+            return "".join([c.get("text","") for c in raw["content"] if c.get("type")=="text"]).strip()
+        out = raw.get("output", {})
+        msg = out.get("message", {})
+        cont = msg.get("content", [])
+        if isinstance(cont, list) and cont and isinstance(cont[0], dict) and "text" in cont[0]:
+            return cont[0]["text"]
+        if "completion" in raw and isinstance(raw["completion"], str):
+            return raw["completion"]
+    return ""
+
+def call_llm(prompt: str) -> str:
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "messages": [{"role":"user","content":[{"type":"text","text":prompt}]}],
+    }
+    resp = bedrock.invoke_model(
+        modelId=LLM_MODEL,
+        body=json.dumps(body),
+        accept="application/json",
+        contentType="application/json",
+    )
+    raw = json.loads(resp["body"].read())
+    return _extract_text_any(raw).strip()
+
+
+# ----------------- Store loading -----------------
+def load_pair(company: str, client: str, root: Path = FAISS_ROOT):
+    pair_dir = root / company / client
+    ev_path = pair_dir / "evidence.jsonl"
+    ix_path = pair_dir / "faiss.index"
+    if not ev_path.exists() or not ix_path.exists():
+        raise FileNotFoundError(f"Missing store for {company}/{client}: {pair_dir}")
+
+    evidence = []
+    with open(ev_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                evidence.append(json.loads(line))
+
+    index = faiss.read_index(str(ix_path))
+    if index.ntotal != len(evidence):
+        raise RuntimeError(f"FAISS ntotal {index.ntotal} != evidence rows {len(evidence)} for {company}/{client}")
+
+    # Precompute table map: table_key -> list of row doc_ids (sorted by row_index/doc_id)
+    table_map: Dict[Tuple[str,str,str], List[int]] = defaultdict(list)
+
+    def loc_prefix(loc: Any) -> str:
+        s = str(loc or "")
+        # remove row suffix if your loc has "ROW=" patterns
+        return s.split("ROW=")[0].strip()
+
+    for doc_id, it in enumerate(evidence):
+        if it.get("type") == "TABLE_ROW":
+            key = (str(it.get("file","") or ""), str(it.get("table_id") or ""), loc_prefix(it.get("loc")))
+            table_map[key].append(doc_id)
+
+    # deterministic sort within each table by row_index then doc_id
+    for k, ids in table_map.items():
+        ids.sort(key=lambda d: (
+            evidence[d].get("row_index") if evidence[d].get("row_index") is not None else 10**9,
+            d
+        ))
+        table_map[k] = ids
+
+    return evidence, index, table_map
+
+
+# ----------------- Table block building -----------------
+def _parse_headers_values(row_text: str) -> Tuple[str, str]:
+    headers = ""
+    values = ""
+    for ln in (row_text or "").splitlines():
+        s = ln.strip()
+        if s.upper().startswith("HEADERS:"):
+            headers = s.split(":", 1)[1].strip()
+        elif s.upper().startswith("VALUES:"):
+            values = s.split(":", 1)[1].strip()
+    return headers, values
+
+def _pick_row_window(evidence: List[Dict[str,Any]], row_ids: List[int], target_row_index: Optional[int], cap: int) -> List[int]:
+    if cap is None or len(row_ids) <= cap:
+        return row_ids
+
+    # choose a window centered around the retrieved row_index (if known)
+    if target_row_index is None:
+        return row_ids[:cap]
+
+    # find closest row in sorted list
+    row_indices = [
+        evidence[d].get("row_index") if evidence[d].get("row_index") is not None else 10**9
+        for d in row_ids
+    ]
+    # index of closest
+    best_i = 0
+    best_dist = abs(row_indices[0] - target_row_index)
+    for i, ri in enumerate(row_indices):
+        dist = abs(ri - target_row_index)
+        if dist < best_dist:
+            best_dist = dist
+            best_i = i
+
+    half = cap // 2
+    start = max(0, best_i - half)
+    end = min(len(row_ids), start + cap)
+    start = max(0, end - cap)
+    return row_ids[start:end]
+
+def build_table_blocks_for_triggered_tables(
+    evidence: List[Dict[str,Any]],
+    triggered: Dict[Tuple[str,str,str], List[int]],  # table_key -> retrieved row doc_ids (subset)
+    table_map: Dict[Tuple[str,str,str], List[int]],
+    max_tables: int,
+    max_rows_per_table: Optional[int],
+    max_chars_per_block: int,
+) -> List[Dict[str,Any]]:
+    blocks = []
+
+    # Deterministic: order tables by best retrieved row_id (smallest doc_id) then key
+    table_keys = sorted(triggered.keys(), key=lambda k: (min(triggered[k]), k[0], k[1], k[2]))[:max_tables]
+
+    for tkey in table_keys:
+        file, table_id, loc_pref = tkey
+        all_row_ids = table_map.get(tkey, [])
+        if not all_row_ids:
+            continue
+
+        # choose a "target row" from retrieved rows for window selection
+        retrieved_ids = triggered[tkey]
+        target_row_index = None
+        # pick the best (smallest doc_id) retrieved row to anchor the window
+        anchor = min(retrieved_ids)
+        target_row_index = evidence[anchor].get("row_index")
+
+        row_ids = _pick_row_window(evidence, all_row_ids, target_row_index, max_rows_per_table) if max_rows_per_table else all_row_ids
+
+        # determine headers (first row that has HEADERS:)
+        headers = ""
+        for d in row_ids:
+            h, _ = _parse_headers_values(evidence[d].get("content",""))
+            if h:
+                headers = h
+                break
+        headers = headers or "(unknown headers)"
+
+        # build content, split if too large
+        def make_block(chunk_ids: List[int], chunk_idx: int) -> Dict[str,Any]:
+            r0 = evidence[chunk_ids[0]].get("row_index")
+            r1 = evidence[chunk_ids[-1]].get("row_index")
+
+            vals = []
+            for d in chunk_ids:
+                _, v = _parse_headers_values(evidence[d].get("content",""))
+                vals.append(v if v else (evidence[d].get("content","") or "").strip())
+
+            content = (
+                f"TYPE=TABLE_BLOCK\n"
+                f"FILE={file}\n"
+                f"TABLE_ID={table_id}\n"
+                f"LOC={loc_pref}\n"
+                f"ROW_RANGE={r0}-{r1}\n"
+                f"HEADERS: {headers}\n"
+                f"ROWS:\n- " + "\n- ".join(vals)
+            )
+            return {
+                "type": "TABLE_BLOCK",
+                "file": file,
+                "table_id": table_id,
+                "loc": loc_pref if chunk_idx == 1 else f"{loc_pref} CHUNK={chunk_idx}",
+                "row_index": r0,
+                "doc_ids": chunk_ids,
+                "content": content,
+            }
+
+        # try single block first
+        blk = make_block(row_ids, 1)
+        if len(blk["content"]) <= max_chars_per_block:
+            blocks.append(blk)
+        else:
+            # deterministic split by rows
+            chunk_size = 250
+            chunk_idx = 1
+            for i in range(0, len(row_ids), chunk_size):
+                blocks.append(make_block(row_ids[i:i+chunk_size], chunk_idx))
+                chunk_idx += 1
+
+    return blocks
+
+
+# ----------------- Main RAG function -----------------
+def rag_answer(company: str, client: str, question: str, top_k: int = TOP_K):
+    evidence, index, table_map = load_pair(company, client)
+
+    # 1) initial retrieval (use slightly deeper search for better table triggering)
+    qvec = embed_query(question)
+    k = max(top_k, EXTRA_K_FOR_TABLES)
+    scores, ids = index.search(qvec, k)
+
+    # collect retrieved hits
+    hits = []
+    triggered_tables: Dict[Tuple[str,str,str], List[int]] = defaultdict(list)
+
+    def _loc_prefix(loc: Any) -> str:
+        s = str(loc or "")
+        return s.split("ROW=")[0].strip()
+
+    for s, doc_id in zip(scores[0].tolist(), ids[0].tolist()):
+        if doc_id < 0:
+            continue
+        it = evidence[doc_id]
+        hits.append((float(s), int(doc_id), it))
+
+        # record table triggers
+        if it.get("type") == "TABLE_ROW":
+            tkey = (str(it.get("file","") or ""), str(it.get("table_id") or ""), _loc_prefix(it.get("loc")))
+            triggered_tables[tkey].append(int(doc_id))
+
+    # deterministic sorting of hits (score desc, doc_id asc)
+    hits.sort(key=lambda x: (-x[0], x[1]))
+
+    # 2) build context: include top non-table snippets + expanded TABLE_BLOCKS (instead of individual rows)
+    non_table_snips = []
+    for s, doc_id, it in hits:
+        if it.get("type") == "TABLE_ROW":
+            continue
+        non_table_snips.append({
+            "doc_id": doc_id,
+            "score": s,
+            "type": it.get("type",""),
+            "file": it.get("file",""),
+            "loc": it.get("loc",""),
+            "content": it.get("content","") or "",
+        })
+
+    # Keep the best few non-table snippets
+    non_table_snips = non_table_snips[:top_k]
+
+    table_blocks = build_table_blocks_for_triggered_tables(
+        evidence=evidence,
+        triggered=triggered_tables,
+        table_map=table_map,
+        max_tables=MAX_TABLES_IN_CONTEXT,
+        max_rows_per_table=MAX_ROWS_PER_TABLE_BLOCK,
+        max_chars_per_block=MAX_CHARS_PER_TABLE_BLOCK,
+    )
+
+    # Assemble context with a hard character cap
+    context_parts = []
+
+    def add_part(txt: str):
+        if sum(len(x) for x in context_parts) + len(txt) > MAX_CONTEXT_CHARS:
+            return False
+        context_parts.append(txt)
+        return True
+
+    # add text blocks first
+    for sn in non_table_snips:
+        txt = (
+            f"[DOC {sn['doc_id']}] score={sn['score']:.4f} type={sn['type']} file={sn['file']} loc={sn['loc']}\n"
+            f"{sn['content']}\n"
+        )
+        if not add_part(txt):
+            break
+
+    # add table blocks next
+    for tb in table_blocks:
+        txt = (
+            f"[TABLE_BLOCK] file={tb['file']} table_id={tb['table_id']} loc={tb['loc']} rows_doc_ids={tb['doc_ids'][:5]}{'...' if len(tb['doc_ids'])>5 else ''}\n"
+            f"{tb['content']}\n"
+        )
+        if not add_part(txt):
+            break
+
+    context = "\n---\n".join(context_parts)
+
+    prompt = f"""Answer the question using ONLY the context below.
+If the answer is not explicitly present, reply exactly: Not found
+
+Question: {question}
+
+Context:
+{context}
+"""
+
+    answer = call_llm(prompt)
+
+    # Return answer + what was used
+    return {
+        "company": company,
+        "client": client,
+        "question": question,
+        "answer": answer,
+        "non_table_docs_used": [{"doc_id": x["doc_id"], "score": x["score"], "file": x["file"], "loc": x["loc"], "type": x["type"]} for x in non_table_snips],
+        "tables_used": [{"file": t["file"], "table_id": t["table_id"], "loc": t["loc"], "num_rows_in_block": len(t["doc_ids"])} for t in table_blocks],
+        "context_preview": context[:2000],
+    }
+
+
+# ----------------- RUN -----------------
+result = rag_answer(COMPANY, CLIENT, QUESTION, top_k=TOP_K)
+print("\nANSWER:\n", result["answer"])
+print("\nNON-TABLE DOCS USED:")
+for d in result["non_table_docs_used"]:
+    print(" -", d)
+print("\nTABLES USED:")
+for t in result["tables_used"]:
+    print(" -", t)
+print("\nCONTEXT PREVIEW (first 2000 chars):\n", result["context_preview"])
