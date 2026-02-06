@@ -1,301 +1,33 @@
-# indexer.py
-# Build one FAISS index per (company, client_id) from a global evidence.jsonl.
+# ============================
+# ragservice in ONE Jupyter cell (per-client FAISS + deterministic + TEXT-first then TABLE-block fallback)
 #
-# Output:
-#   <faiss_index_root>/<company>/<client_id>/
-#       evidence.jsonl     (doc_id reset to 0..N-1 aligned to FAISS ids)
-#       faiss.index
-#       meta.json
-#   <faiss_index_root>/manifest.json
-#
-# Requires:
-#   config.json: aws_region, evidence_jsonl_path, faiss_index_root (optional)
-#   env: BEDROCK_EMBED_MODEL_ID
-
-import json
-import os
-import time
-from collections import OrderedDict
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
-
-import boto3
-import faiss
-import numpy as np
-from botocore.exceptions import ClientError
-
-
-def load_config(path: str = "config.json") -> dict:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-
-def stable_item_key(it: Dict[str, Any]) -> Tuple:
-    # Deterministic ordering within a (company, client_id) group
-    return (
-        str(it.get("file", "")),
-        str(it.get("filetype", "")),
-        str(it.get("type", "")),
-        str(it.get("loc", "")),
-        str(it.get("table_id", "")),
-        int(it.get("row_index", 10**9)) if it.get("row_index") is not None else 10**9,
-        int(it.get("doc_id", 0)) if it.get("doc_id") is not None else 0,
-    )
-
-
-def embed_titan_with_retry(
-    bedrock,
-    model_id: str,
-    text: str,
-    max_retries: int = 7,
-) -> np.ndarray:
-    backoff = 1.0
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            resp = bedrock.invoke_model(
-                modelId=model_id,
-                body=json.dumps({"inputText": text}),
-                accept="application/json",
-                contentType="application/json",
-            )
-            vec = json.loads(resp["body"].read())["embedding"]
-            v = np.array(vec, dtype="float32")
-            n = np.linalg.norm(v)
-            if n > 0:
-                v = v / n
-            return v
-        except ClientError as e:
-            last_err = e
-            code = e.response.get("Error", {}).get("Code", "")
-            if code in ("ThrottlingException", "TooManyRequestsException", "ServiceUnavailableException"):
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 20.0)
-                continue
-            raise
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff)
-            backoff = min(backoff * 2.0, 20.0)
-
-    raise RuntimeError(f"Embedding failed after retries. Last error: {last_err!r}")
-
-
-class _LRUFileWriters:
-    """
-    Avoid keeping too many file handles open while routing evidence rows to per-client raw jsonl files.
-    """
-    def __init__(self, max_open: int = 32):
-        self.max_open = max_open
-        self._open: OrderedDict[str, Any] = OrderedDict()
-
-    def write_line(self, path: Path, line: str) -> None:
-        key = str(path)
-        if key in self._open:
-            fh = self._open.pop(key)
-            self._open[key] = fh
-        else:
-            if len(self._open) >= self.max_open:
-                _, old = self._open.popitem(last=False)
-                try:
-                    old.close()
-                except Exception:
-                    pass
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fh = open(path, "a", encoding="utf-8")
-            self._open[key] = fh
-
-        fh.write(line)
-
-    def close_all(self) -> None:
-        for _, fh in list(self._open.items()):
-            try:
-                fh.close()
-            except Exception:
-                pass
-        self._open.clear()
-
-
-def main():
-    cfg = load_config()
-
-    region = cfg.get("aws_region", "us-east-1")
-    evidence_path = Path(cfg["evidence_jsonl_path"])
-
-    out_root = Path(cfg.get("faiss_index_root", "index/by_client"))
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    embed_model_id = os.getenv("BEDROCK_EMBED_MODEL_ID")
-    if not embed_model_id:
-        raise RuntimeError("Set env var BEDROCK_EMBED_MODEL_ID")
-
-    print("[indexer] region:", region)
-    print("[indexer] evidence:", evidence_path)
-    print("[indexer] out_root:", out_root)
-    print("[indexer] embed_model:", embed_model_id)
-
-    session = boto3.Session(region_name=region)
-    bedrock = session.client("bedrock-runtime")
-
-    # -------- Pass 1: route into per-client raw jsonl files --------
-    writers = _LRUFileWriters(max_open=48)
-    pairs_set = set()
-    total_in = 0
-    total_routed = 0
-
-    # We write raw evidence to:
-    #   <out_root>/_raw/<company>/<client_id>/raw_evidence.jsonl
-    raw_root = out_root / "_raw"
-    raw_root.mkdir(parents=True, exist_ok=True)
-
-    for it in iter_jsonl(evidence_path):
-        total_in += 1
-        company = str(it.get("company", "")).strip()
-        client_id = str(it.get("client_id", "")).strip()
-        if not company or not client_id:
-            continue
-
-        pairs_set.add((company, client_id))
-
-        raw_path = raw_root / company / client_id / "raw_evidence.jsonl"
-        writers.write_line(raw_path, json.dumps(it, ensure_ascii=False) + "\n")
-        total_routed += 1
-
-        if total_in % 5000 == 0:
-            print(f"[indexer] routed {total_routed} rows (seen {len(pairs_set)} pairs)")
-
-    writers.close_all()
-
-    pairs = sorted(pairs_set, key=lambda x: (x[0], x[1]))
-    print(f"[indexer] total read: {total_in}, routed: {total_routed}, pairs: {len(pairs)}")
-
-    manifest = {
-        "aws_region": region,
-        "embed_model_id": embed_model_id,
-        "built_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "pairs": [],
-    }
-
-    # -------- Pass 2: build per-client index + aligned evidence.jsonl --------
-    for i, (company, client_id) in enumerate(pairs, start=1):
-        raw_path = raw_root / company / client_id / "raw_evidence.jsonl"
-        if not raw_path.exists():
-            continue
-
-        pair_dir = out_root / company / client_id
-        pair_dir.mkdir(parents=True, exist_ok=True)
-
-        out_evidence = pair_dir / "evidence.jsonl"
-        out_index = pair_dir / "faiss.index"
-        out_meta = pair_dir / "meta.json"
-
-        items: List[Dict[str, Any]] = []
-        with open(raw_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    items.append(json.loads(line))
-
-        # deterministic order
-        items.sort(key=stable_item_key)
-
-        print(f"\n[indexer] ({i}/{len(pairs)}) build {company}/{client_id} source_rows={len(items)}")
-        t0 = time.time()
-
-        faiss_index = None
-        dim = None
-        indexed_count = 0
-
-        with open(out_evidence, "w", encoding="utf-8") as ef:
-            for src_it in items:
-                content = src_it.get("content", "")
-                if not isinstance(content, str) or not content.strip():
-                    continue
-
-                v = embed_titan_with_retry(bedrock, embed_model_id, content)
-
-                if faiss_index is None:
-                    dim = int(v.shape[0])
-                    faiss_index = faiss.IndexFlatIP(dim)
-
-                faiss_index.add(v.reshape(1, -1))
-                local_doc_id = int(faiss_index.ntotal - 1)
-
-                out_it = dict(src_it)
-                out_it["global_doc_id"] = out_it.get("doc_id")
-                out_it["doc_id"] = local_doc_id
-
-                ef.write(json.dumps(out_it, ensure_ascii=False) + "\n")
-                indexed_count += 1
-
-                if indexed_count % 250 == 0:
-                    print(f"[indexer]   embedded={indexed_count} faiss_ntotal={faiss_index.ntotal}")
-
-        if faiss_index is None or indexed_count == 0:
-            print("[indexer]   skipped (no embeddable rows).")
-            continue
-
-        faiss.write_index(faiss_index, str(out_index))
-
-        meta = {
-            "company": company,
-            "client_id": client_id,
-            "rows_in_source_group": len(items),
-            "rows_indexed": indexed_count,
-            "faiss_dim": dim,
-            "embed_model_id": embed_model_id,
-            "built_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        out_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        manifest["pairs"].append(
-            {
-                "company": company,
-                "client_id": client_id,
-                "rows_indexed": indexed_count,
-                "path": str(pair_dir.as_posix()),
-            }
-        )
-
-        print(f"[indexer]   saved -> {out_index} (took {time.time()-t0:.2f}s)")
-
-    (out_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n[indexer] DONE. Manifest: {out_root / 'manifest.json'}")
-
-
-if __name__ == "__main__":
-    main()
-
-# ragservice.py
-# Deterministic RAG extraction (per-client indexes):
-# A) Retrieve evidence per field (union) from that client's FAISS
-# B) One Claude call per (Company, Client)
-# C) Prune using normalized substring
-# D) If field not found -> blank in Excel
-#
-# Requires:
-# - config.json:
-#     aws_region
-#     faiss_index_root (e.g., "index/by_client")
-#     excel_path
-#     include_companies / exclude_companies (optional)
-#     retrieval knobs (optional)
+# Requirements:
+# - config.json with at least:
+#     {
+#       "aws_region": "us-east-1",
+#       "faiss_index_root": "index/by_client",
+#       "excel_path": "out/results.xlsx",
+#       "top_each_per_field": 25,
+#       "top_k_retrieve": 250,
+#       "max_evidence_units": 90,
+#       "max_table_units": 60,
+#       "max_text_units": 30
+#     }
 # - env vars:
 #     BEDROCK_EMBED_MODEL_ID
 #     BEDROCK_LLM_MODEL_ID
+#
+# Notes:
+# - Loads per-client stores:
+#     <faiss_index_root>/<company>/<client_id>/evidence.jsonl
+#     <faiss_index_root>/<company>/<client_id>/faiss.index
+# - PASS 1: uses NON-table items only (avoids tables)
+# - PASS 2: only for missing fields, uses TABLE_ROW collapsed into TABLE_BLOCK (whole tables) and sends only tables
+# ============================
 
-import json
-import os
-import re
-from collections import defaultdict
+import json, os, re
 from pathlib import Path
+from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 import boto3
@@ -304,28 +36,87 @@ import numpy as np
 import pandas as pd
 
 
-def load_config(path: str = "config.json") -> dict:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+# ----------------- config -----------------
+cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+AWS_REGION = cfg.get("aws_region", "us-east-1")
+FAISS_ROOT = Path(cfg.get("faiss_index_root", "index/by_client"))
+EXCEL_PATH = Path(cfg.get("excel_path", "out/results.xlsx"))
+
+INCLUDE = cfg.get("include_companies", []) or []
+EXCLUDE = cfg.get("exclude_companies", []) or []
+
+TOP_EACH = int(cfg.get("top_each_per_field", 25))
+TOP_GLOBAL = int(cfg.get("top_k_retrieve", 250))
+
+MAX_UNITS = int(cfg.get("max_evidence_units", 90))
+MAX_TABLE = int(cfg.get("max_table_units", 60))
+MAX_TEXT = int(cfg.get("max_text_units", 30))
+
+# Table-block safety caps (still "table blocks", never row-wise in prompts)
+TABLE_BLOCK_MAX_ROWS = cfg.get("table_block_max_rows", None)      # None => keep whole table if possible
+TABLE_BLOCK_MAX_CHARS = int(cfg.get("table_block_max_chars", 25000))
+
+# Choose which to run
+RUN_ALL_PAIRS = bool(cfg.get("run_all_pairs", True))
+TEST_COMPANY = cfg.get("test_company", "")  # if RUN_ALL_PAIRS=False, set these
+TEST_CLIENT  = cfg.get("test_client", "")
+
+# ----------------- models -----------------
+BEDROCK_EMBED_MODEL_ID = os.getenv("BEDROCK_EMBED_MODEL_ID")
+BEDROCK_LLM_MODEL_ID   = os.getenv("BEDROCK_LLM_MODEL_ID")
+if not BEDROCK_EMBED_MODEL_ID or not BEDROCK_LLM_MODEL_ID:
+    raise RuntimeError("Set env vars: BEDROCK_EMBED_MODEL_ID and BEDROCK_LLM_MODEL_ID")
+
+session = boto3.Session(region_name=AWS_REGION)
+bedrock = session.client("bedrock-runtime")
 
 
-def allowed_company(company: str, include, exclude) -> bool:
-    include = include or []
-    exclude = exclude or []
-    if include and company not in include:
+# ----------------- fields -----------------
+FIELDS = [
+    "airlines included in the contract",
+    "OSI",
+    "TKT Designator",
+    "TOUR CODE",
+    "Contact",
+    "Global Account Manager",
+    "contract Expiry date",
+    "GDS fare loading codes",
+    "Air corporate Loyality Program",
+    "Perks ID",
+    "Point of sale validity which market this deal can be sold from?",
+    "fare/route details and ticketing instruction received",
+    "status",
+    "conteact expire",
+]
+
+FIELD_SYNONYMS = {
+    "contract Expiry date": ["expiration date", "expiry date", "valid until", "validity", "expires"],
+    "TOUR CODE": ["tourcode", "tour code", "tour-code"],
+    "TKT Designator": ["ticket designator", "tkt designator"],
+    "OSI": ["other service information", "OSI"],
+    "GDS fare loading codes": ["fare loading code", "GDS code", "loading code"],
+    "Air corporate Loyality Program": ["corporate loyalty program", "loyalty program"],
+    "Contact": ["point of contact", "POC", "contact"],
+    "status": ["current status", "status"],
+    "fare/route details and ticketing instruction received": ["ticketing instruction", "ticketing instructions", "route details", "fare details"],
+}
+
+
+# ----------------- helpers -----------------
+def allowed_company(company: str) -> bool:
+    if INCLUDE and company not in INCLUDE:
         return False
-    if exclude and company in exclude:
+    if EXCLUDE and company in EXCLUDE:
         return False
     return True
-
 
 def normalize(s: str) -> str:
     s = (s or "").replace("\u00a0", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
-def prune_fields(fields_dict, evidence_text):
-    ev = normalize(evidence_text)
+def prune_fields(fields_dict: dict, evidence_content_blob: str) -> dict:
+    ev = normalize(evidence_content_blob)
     cleaned = {}
     for k, v in (fields_dict or {}).items():
         if isinstance(v, str) and v.strip():
@@ -333,10 +124,16 @@ def prune_fields(fields_dict, evidence_text):
                 cleaned[k] = v
     return cleaned
 
+def safe_json_load(text: str) -> dict:
+    text = (text or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        text = m.group(0)
+    return json.loads(text)
 
-def embed_titan(bedrock, model_id: str, text: str) -> np.ndarray:
+def embed_titan(text: str) -> np.ndarray:
     resp = bedrock.invoke_model(
-        modelId=model_id,
+        modelId=BEDROCK_EMBED_MODEL_ID,
         body=json.dumps({"inputText": text}),
         accept="application/json",
         contentType="application/json",
@@ -348,100 +145,54 @@ def embed_titan(bedrock, model_id: str, text: str) -> np.ndarray:
         v = v / n
     return v.reshape(1, -1)
 
-
 def extract_text_any(raw: dict) -> str:
     if isinstance(raw, dict):
         if "content" in raw and isinstance(raw["content"], list) and raw["content"]:
             first = raw["content"][0]
             if isinstance(first, dict) and "text" in first:
                 return first["text"]
-
         out = raw.get("output", {})
         msg = out.get("message", {})
         cont = msg.get("content", [])
         if isinstance(cont, list) and cont and isinstance(cont[0], dict) and "text" in cont[0]:
             return cont[0]["text"]
-
         if "completion" in raw and isinstance(raw["completion"], str):
             return raw["completion"]
-
     return ""
 
-
-def call_claude(bedrock, model_id: str, prompt: str) -> str:
+def call_claude(prompt: str) -> str:
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "temperature": 0,
         "max_tokens": 1600,
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
     }
-
     resp = bedrock.invoke_model(
-        modelId=model_id,
+        modelId=BEDROCK_LLM_MODEL_ID,
         body=json.dumps(body),
         accept="application/json",
         contentType="application/json",
     )
-
     raw_text = resp["body"].read().decode("utf-8", errors="replace")
     raw_json = json.loads(raw_text)
     return extract_text_any(raw_json)
 
-
-def stable_sort_key(it):
-    # deterministic ordering for evidence selection
-    # (rank tables first like your current behavior; also support TABLE_BLOCK)
-    t = it.get("type")
-    type_rank = 0 if t in ("TABLE_ROW", "TABLE_BLOCK") else 1
-    file_name = it.get("file", "")
-    loc = it.get("loc", "")
-    table_id = it.get("table_id") or ""
-    row = it.get("row_index") if it.get("row_index") is not None else 10**9
-    score = float(it.get("_score", 0.0))
-    # Use score first (deterministic), then original stable fields
-    return (-score, type_rank, file_name, loc, table_id, row, it.get("doc_id", 0))
-
-
-def pick_evidence(items, max_units=90, max_table=60, max_text=30):
-    items = list(items)
-    items.sort(key=stable_sort_key)
-
-    picked, t_count, x_count = [], 0, 0
-    for it in items:
-        if it.get("type") in ("TABLE_ROW", "TABLE_BLOCK"):
-            if t_count >= max_table:
-                continue
-            t_count += 1
-        else:
-            if x_count >= max_text:
-                continue
-            x_count += 1
-
-        picked.append(it)
-        if len(picked) >= max_units:
-            break
-
-    return picked
-
-
-def expand_retrieval_queries(fields, field_synonyms):
+def expand_retrieval_queries(fields: List[str]) -> List[str]:
     queries = []
     for f in fields:
         queries.append(f)
-        for syn in field_synonyms.get(f, []):
+        for syn in FIELD_SYNONYMS.get(f, []):
             queries.append(syn)
     return queries
 
-
-def load_pair_store(faiss_root: Path, company: str, client_id: str) -> Tuple[List[Dict[str, Any]], faiss.Index]:
-    pair_dir = faiss_root / company / client_id
+def load_pair_store(company: str, client_id: str) -> Tuple[List[Dict[str, Any]], faiss.Index]:
+    pair_dir = FAISS_ROOT / company / client_id
     evidence_path = pair_dir / "evidence.jsonl"
     index_path = pair_dir / "faiss.index"
-
     if not evidence_path.exists() or not index_path.exists():
-        raise FileNotFoundError(f"Missing per-client store for {company}/{client_id}: {pair_dir}")
+        raise FileNotFoundError(f"Missing store: {pair_dir}")
 
-    # IMPORTANT: do NOT sort; order must align with FAISS ids (doc_id == list index)
+    # IMPORTANT: do NOT sort; order must align with FAISS ids
     items = []
     with open(evidence_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -450,34 +201,49 @@ def load_pair_store(faiss_root: Path, company: str, client_id: str) -> Tuple[Lis
                 items.append(json.loads(line))
 
     idx = faiss.read_index(str(index_path))
-
-    # Sanity check alignment (optional)
     if idx.ntotal != len(items):
         raise RuntimeError(f"FAISS ntotal ({idx.ntotal}) != evidence rows ({len(items)}) for {company}/{client_id}")
 
     return items, idx
 
+def list_pairs_from_root() -> List[Tuple[str, str]]:
+    manifest = FAISS_ROOT / "manifest.json"
+    if manifest.exists():
+        m = json.loads(manifest.read_text(encoding="utf-8"))
+        pairs = []
+        for p in m.get("pairs", []) or []:
+            c = p.get("company"); cl = p.get("client_id")
+            if c and cl:
+                pairs.append((c, cl))
+        pairs = sorted(pairs, key=lambda x: (x[0], x[1]))
+        return [pc for pc in pairs if allowed_company(pc[0])]
 
-def retrieve_union_for_fields(
-    evidence_items,
-    faiss_index,
-    bedrock,
-    embed_model_id: str,
-    queries,
-    top_each: int = 25,
-    top_global: int = 250,
-):
-    """
-    Deterministic union retrieval FROM A SINGLE CLIENT'S INDEX:
-      - per query: top_each -> union
-      - plus global query: top_global -> union
-    Stores best similarity score per doc_id as _score for better picking.
-    """
+    # fallback scan
+    pairs = []
+    for cdir in FAISS_ROOT.iterdir():
+        if not cdir.is_dir() or cdir.name.startswith("_"):
+            continue
+        if not allowed_company(cdir.name):
+            continue
+        for cldir in cdir.iterdir():
+            if not cldir.is_dir():
+                continue
+            if (cldir / "faiss.index").exists() and (cldir / "evidence.jsonl").exists():
+                pairs.append((cdir.name, cldir.name))
+    return sorted(pairs, key=lambda x: (x[0], x[1]))
+
+def retrieve_union_for_queries(
+    evidence_items: List[Dict[str, Any]],
+    faiss_index: faiss.Index,
+    queries: List[str],
+    top_each: int,
+    top_global: int
+) -> List[Dict[str, Any]]:
     all_ids = set()
     best_score: Dict[int, float] = {}
 
     for q in queries:
-        qvec = embed_titan(bedrock, embed_model_id, q)
+        qvec = embed_titan(q)
         scores, ids = faiss_index.search(qvec, top_each)
         for s, doc_id in zip(scores[0].tolist(), ids[0].tolist()):
             if doc_id < 0:
@@ -487,7 +253,7 @@ def retrieve_union_for_fields(
                 best_score[doc_id] = float(s)
 
     global_q = " | ".join(queries[: min(len(queries), 60)])
-    qvec = embed_titan(bedrock, embed_model_id, global_q)
+    qvec = embed_titan(global_q)
     scores, ids = faiss_index.search(qvec, top_global)
     for s, doc_id in zip(scores[0].tolist(), ids[0].tolist()):
         if doc_id < 0:
@@ -503,8 +269,44 @@ def retrieve_union_for_fields(
         out.append(it)
     return out
 
+def stable_sort_key(it: Dict[str, Any]):
+    # score-first deterministic, then stable metadata
+    score = float(it.get("_score", 0.0))
+    t = it.get("type", "")
+    type_rank = 0 if t in ("TABLE_ROW", "TABLE_BLOCK") else 1
+    file_name = it.get("file", "")
+    loc = it.get("loc", "")
+    table_id = it.get("table_id") or ""
+    row = it.get("row_index") if it.get("row_index") is not None else 10**9
+    return (-score, type_rank, file_name, loc, table_id, row, it.get("doc_id", 0))
 
-# ---------- OPTIONAL: collapse TABLE_ROW -> TABLE_BLOCK ----------
+def pick_evidence(items: List[Dict[str, Any]], max_units: int, max_table: int, max_text: int,
+                 allow_tables: bool = True, allow_text: bool = True) -> List[Dict[str, Any]]:
+    items = list(items)
+    items.sort(key=stable_sort_key)
+
+    picked, t_count, x_count = [], 0, 0
+    for it in items:
+        is_table = it.get("type") in ("TABLE_ROW", "TABLE_BLOCK")
+        if is_table:
+            if not allow_tables:
+                continue
+            if t_count >= max_table:
+                continue
+            t_count += 1
+        else:
+            if not allow_text:
+                continue
+            if x_count >= max_text:
+                continue
+            x_count += 1
+
+        picked.append(it)
+        if len(picked) >= max_units:
+            break
+    return picked
+
+# ---- Collapse TABLE_ROW -> TABLE_BLOCK (whole table in prompt, deterministic) ----
 def _parse_headers_values(row_text: str) -> Tuple[str, str]:
     headers = ""
     values = ""
@@ -516,48 +318,37 @@ def _parse_headers_values(row_text: str) -> Tuple[str, str]:
             values = s.split(":", 1)[1].strip()
     return headers, values
 
-
-def collapse_table_rows_to_blocks(
-    items: List[Dict[str, Any]],
-    max_rows_per_block: int | None = None,     # None => try to keep whole table in one block
-    max_chars_per_block: int = 25000,          # safety: split if block becomes too large
-) -> List[Dict[str, Any]]:
+def collapse_table_rows_to_blocks(items: List[Dict[str, Any]],
+                                  max_rows_per_block=None,
+                                  max_chars_per_block=25000) -> List[Dict[str, Any]]:
     non_table = [it for it in items if it.get("type") != "TABLE_ROW"]
     rows = [it for it in items if it.get("type") == "TABLE_ROW"]
 
     groups = defaultdict(list)
-
     def group_key(it):
         file = it.get("file", "") or ""
         table_id = it.get("table_id") or ""
         loc = it.get("loc", "") or ""
-        # remove row suffixes to avoid grouping separate tables together
         loc_prefix = str(loc).split("ROW=")[0].strip()
         return (file, table_id, loc_prefix)
 
     for r in rows:
         groups[group_key(r)].append(r)
 
-    blocks: List[Dict[str, Any]] = []
+    blocks = []
     for (file, table_id, loc_prefix), rs in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
         rs.sort(key=lambda x: (x.get("row_index") if x.get("row_index") is not None else 10**9, x.get("doc_id", 0)))
-
-        # best score among rows
         max_score = max((float(r.get("_score", 0.0)) for r in rs), default=0.0)
 
-        # try to get headers from first row that has them
         hdr = ""
-        values_list = []
         for r in rs:
-            h, v = _parse_headers_values(r.get("content", ""))
-            if not hdr and h:
+            h, _ = _parse_headers_values(r.get("content", ""))
+            if h:
                 hdr = h
-            values_list.append(v if v else (r.get("content", "") or "").strip())
-
+                break
         hdr = hdr or "(unknown headers)"
 
         def make_block(chunk_rows: List[Dict[str, Any]], chunk_idx: int) -> Dict[str, Any]:
-            # build list of VALUES lines for chunk
             vals = []
             for rr in chunk_rows:
                 _, v = _parse_headers_values(rr.get("content", ""))
@@ -591,46 +382,39 @@ def collapse_table_rows_to_blocks(
             }
             return blk
 
-        # chunking policy: keep whole table unless too big
-        blocks_for_table = []
+        # keep whole table unless too large
         if max_rows_per_block is None:
-            # make one block, check size
             blk = make_block(rs, 1)
             if len(blk["content"]) <= max_chars_per_block:
-                blocks_for_table = [blk]
+                blocks.append(blk)
             else:
-                # split by rows into ~300 chunks (still TABLE_BLOCK)
                 chunk_size = 300
                 chunk_idx = 1
                 for i in range(0, len(rs), chunk_size):
-                    blocks_for_table.append(make_block(rs[i:i + chunk_size], chunk_idx))
+                    blocks.append(make_block(rs[i:i+chunk_size], chunk_idx))
                     chunk_idx += 1
         else:
             chunk_size = int(max_rows_per_block)
             chunk_idx = 1
             for i in range(0, len(rs), chunk_size):
-                blk = make_block(rs[i:i + chunk_size], chunk_idx)
-                # additional safety split if huge
-                if len(blk["content"]) > max_chars_per_block and len(rs[i:i + chunk_size]) > 50:
-                    # split further
-                    sub = rs[i:i + chunk_size]
-                    sub_chunk = 150
+                blk = make_block(rs[i:i+chunk_size], chunk_idx)
+                if len(blk["content"]) > max_chars_per_block and len(rs[i:i+chunk_size]) > 50:
+                    sub = rs[i:i+chunk_size]
+                    sub_size = 150
                     sub_idx = 1
-                    for j in range(0, len(sub), sub_chunk):
-                        blocks_for_table.append(make_block(sub[j:j + sub_chunk], chunk_idx * 100 + sub_idx))
+                    for j in range(0, len(sub), sub_size):
+                        blocks.append(make_block(sub[j:j+sub_size], chunk_idx*100 + sub_idx))
                         sub_idx += 1
                 else:
-                    blocks_for_table.append(blk)
+                    blocks.append(blk)
                 chunk_idx += 1
-
-        blocks.extend(blocks_for_table)
 
     out = non_table + blocks
     out.sort(key=stable_sort_key)
     return out
 
-
-def build_prompt(company: str, client_id: str, fields, evidence_units):
+def build_prompt(company: str, client_id: str, fields: List[str], evidence_units: List[Dict[str, Any]]):
+    # For prompt: include META wrappers
     blocks = []
     for i, it in enumerate(evidence_units, start=1):
         ref = f"EVID_{i}"
@@ -649,6 +433,7 @@ def build_prompt(company: str, client_id: str, fields, evidence_units):
         blocks.append(f"[{ref}]\nMETA: {json.dumps(meta)}\nCONTENT:\n{it.get('content','')}")
 
     evidence_text = "\n\n".join(blocks)
+    evidence_content_blob = "\n\n".join([it.get("content", "") or "" for it in evidence_units])  # for pruning
 
     prompt = (
         "You are a strict extraction engine.\n\n"
@@ -669,186 +454,95 @@ def build_prompt(company: str, client_id: str, fields, evidence_units):
         "Fields:\n- " + "\n- ".join(fields) + "\n\n"
         "EVIDENCE:\n" + evidence_text
     )
-
-    return prompt, evidence_text
-
-
-def list_pairs_from_root(faiss_root: Path) -> List[Tuple[str, str]]:
-    manifest = faiss_root / "manifest.json"
-    if manifest.exists():
-        m = json.loads(manifest.read_text(encoding="utf-8"))
-        pairs = []
-        for p in m.get("pairs", []) or []:
-            c = p.get("company")
-            cl = p.get("client_id")
-            if c and cl:
-                pairs.append((c, cl))
-        return sorted(pairs, key=lambda x: (x[0], x[1]))
-
-    # fallback: scan directories
-    pairs = []
-    for company_dir in faiss_root.iterdir():
-        if not company_dir.is_dir() or company_dir.name.startswith("_"):
-            continue
-        for client_dir in company_dir.iterdir():
-            if not client_dir.is_dir():
-                continue
-            if (client_dir / "faiss.index").exists() and (client_dir / "evidence.jsonl").exists():
-                pairs.append((company_dir.name, client_dir.name))
-    return sorted(pairs, key=lambda x: (x[0], x[1]))
+    return prompt, evidence_content_blob
 
 
-def main():
-    cfg = load_config()
+# ----------------- run -----------------
+pairs = list_pairs_from_root()
+if not pairs:
+    raise RuntimeError(f"No pairs found under {FAISS_ROOT}")
 
-    region = cfg.get("aws_region", "us-east-1")
-    faiss_root = Path(cfg.get("faiss_index_root", "index/by_client"))
-    excel_path = Path(cfg["excel_path"])
+if RUN_ALL_PAIRS:
+    run_pairs = pairs
+else:
+    if not TEST_COMPANY or not TEST_CLIENT:
+        raise RuntimeError("Set cfg test_company and test_client (or set run_all_pairs=true)")
+    run_pairs = [(TEST_COMPANY, TEST_CLIENT)]
 
-    include = cfg.get("include_companies", []) or []
-    exclude = cfg.get("exclude_companies", []) or []
+print("[dbg] pairs to run:", len(run_pairs))
+print("[dbg] first 10:", run_pairs[:10])
 
-    # retrieval knobs
-    top_each = int(cfg.get("top_each_per_field", 25))
-    top_global = int(cfg.get("top_k_retrieve", 250))
+rows_out = []
 
-    # evidence pack knobs
-    max_units = int(cfg.get("max_evidence_units", 90))
-    max_table = int(cfg.get("max_table_units", 60))
-    max_text = int(cfg.get("max_text_units", 30))
+for company, client_id in run_pairs:
+    print(f"\n[rag] processing {company}/{client_id}")
 
-    # NEW knobs (optional)
-    collapse_tables = bool(cfg.get("collapse_tables_to_blocks", True))
-    table_block_max_rows = cfg.get("table_block_max_rows", None)  # None => whole table if possible
-    table_block_max_chars = int(cfg.get("table_block_max_chars", 25000))
-
-    embed_model_id = os.getenv("BEDROCK_EMBED_MODEL_ID")
-    llm_model_id = os.getenv("BEDROCK_LLM_MODEL_ID")
-    if not embed_model_id or not llm_model_id:
-        raise RuntimeError("Set env vars: BEDROCK_EMBED_MODEL_ID and BEDROCK_LLM_MODEL_ID")
-
-    session = boto3.Session(region_name=region)
-    bedrock = session.client("bedrock-runtime")
-
-    # Your extraction fields
-    FIELDS = [
-        "airlines included in the contract",
-        "OSI",
-        "TKT Designator",
-        "TOUR CODE",
-        "Contact",
-        "Global Account Manager",
-        "contract Expiry date",
-        "GDS fare loading codes",
-        "Air corporate Loyality Program",
-        "Perks ID",
-        "Point of sale validity which market this deal can be sold from?",
-        "fare/route details and ticketing instruction received",
-        "status",
-        "conteact expire",
-    ]
-
-    FIELD_SYNONYMS = {
-        "contract Expiry date": ["expiration date", "expiry date", "valid until", "validity", "expires"],
-        "TOUR CODE": ["tourcode", "tour code", "tour-code"],
-        "TKT Designator": ["ticket designator", "tkt designator"],
-        "OSI": ["other service information", "OSI"],
-        "GDS fare loading codes": ["fare loading code", "GDS code", "loading code"],
-        "Air corporate Loyality Program": ["corporate loyalty program", "loyalty program"],
-        "Contact": ["point of contact", "POC", "contact"],
-        "status": ["current status", "status"],
-        "fare/route details and ticketing instruction received": ["ticketing instruction", "ticketing instructions", "route details", "fare details"],
-    }
-
-    retrieval_queries = expand_retrieval_queries(FIELDS, FIELD_SYNONYMS)
-
-    pairs_all = list_pairs_from_root(faiss_root)
-    # apply include/exclude companies
-    pairs = [(c, cl) for (c, cl) in pairs_all if allowed_company(c, include, exclude)]
-
-    if not pairs:
-        print("[ragservice] No (company, client) pairs found under faiss_index_root.")
-        return
-
-    rows = []
-
-    for company, client_id in pairs:
-        print(f"[ragservice] processing {company}/{client_id}")
-
-        try:
-            evidence_items, faiss_index = load_pair_store(faiss_root, company, client_id)
-        except Exception as e:
-            print(f"  [warn] load_pair_store failed: {e}")
-            row = {"Company": company, "Client": client_id}
-            for f in FIELDS:
-                row[f] = ""
-            rows.append(row)
-            continue
-
-        # A) retrieve union evidence (per-field + global)
-        candidates = retrieve_union_for_fields(
-            evidence_items=evidence_items,
-            faiss_index=faiss_index,
-            bedrock=bedrock,
-            embed_model_id=embed_model_id,
-            queries=retrieval_queries,
-            top_each=top_each,
-            top_global=top_global,
-        )
-
-        # Optional: convert TABLE_ROW hits to TABLE_BLOCK before picking/prompting
-        if collapse_tables:
-            candidates = collapse_table_rows_to_blocks(
-                candidates,
-                max_rows_per_block=table_block_max_rows,
-                max_chars_per_block=table_block_max_chars,
-            )
-
-        picked = pick_evidence(candidates, max_units=max_units, max_table=max_table, max_text=max_text)
-
-        if not picked:
-            row = {"Company": company, "Client": client_id}
-            for f in FIELDS:
-                row[f] = ""
-            rows.append(row)
-            continue
-
-        prompt, evidence_text = build_prompt(company, client_id, FIELDS, picked)
-
-        try:
-            out_text = call_claude(bedrock, llm_model_id, prompt)
-        except Exception as e:
-            print(f"  [warn] Claude invoke failed: {e}")
-            row = {"Company": company, "Client": client_id}
-            for f in FIELDS:
-                row[f] = ""
-            rows.append(row)
-            continue
-
-        try:
-            parsed = json.loads(out_text)
-        except Exception:
-            row = {"Company": company, "Client": client_id}
-            for f in FIELDS:
-                row[f] = ""
-            rows.append(row)
-            continue
-
-        raw_fields = parsed.get("fields", {}) if isinstance(parsed, dict) else {}
-        pruned = prune_fields(raw_fields, evidence_text)
-
+    try:
+        evidence_items, faiss_index = load_pair_store(company, client_id)
+    except Exception as e:
+        print("  [warn] load_pair_store failed:", e)
         row = {"Company": company, "Client": client_id}
         for f in FIELDS:
-            row[f] = pruned.get(f, "")
-        rows.append(row)
+            row[f] = ""
+        rows_out.append(row)
+        continue
 
-    excel_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_excel(excel_path, index=False)
-    print(f"[ragservice] saved -> {excel_path}")
+    # ---------- PASS 1: TEXT ONLY ----------
+    queries1 = expand_retrieval_queries(FIELDS)
+    cand1 = retrieve_union_for_queries(evidence_items, faiss_index, queries1, TOP_EACH, TOP_GLOBAL)
+    cand1_text = [it for it in cand1 if it.get("type") not in ("TABLE_ROW", "TABLE_BLOCK")]
+    picked1 = pick_evidence(cand1_text, max_units=MAX_UNITS, max_table=0, max_text=max(MAX_TEXT, MAX_UNITS),
+                            allow_tables=False, allow_text=True)
 
+    if not picked1:
+        pruned1 = {}
+        missing = list(FIELDS)
+    else:
+        prompt1, blob1 = build_prompt(company, client_id, FIELDS, picked1)
+        try:
+            out1 = call_claude(prompt1)
+            parsed1 = safe_json_load(out1)
+            raw_fields_1 = parsed1.get("fields", {}) if isinstance(parsed1, dict) else {}
+            pruned1 = prune_fields(raw_fields_1, blob1)
+        except Exception as e:
+            print("  [warn] PASS1 failed:", e)
+            pruned1 = {}
 
-if __name__ == "__main__":
-    main()
+        missing = [f for f in FIELDS if not pruned1.get(f)]
 
+    # ---------- PASS 2: TABLE BLOCKS ONLY (for missing) ----------
+    final_fields = dict(pruned1)
 
-      
+    if missing:
+        queries2 = expand_retrieval_queries(missing)
+        cand2 = retrieve_union_for_queries(evidence_items, faiss_index, queries2, TOP_EACH, TOP_GLOBAL)
+        # collapse TABLE_ROW to TABLE_BLOCK and keep only tables
+        cand2_blocks = collapse_table_rows_to_blocks(cand2, max_rows_per_block=TABLE_BLOCK_MAX_ROWS, max_chars_per_block=TABLE_BLOCK_MAX_CHARS)
+        cand2_tables = [it for it in cand2_blocks if it.get("type") == "TABLE_BLOCK"]
+
+        picked2 = pick_evidence(cand2_tables, max_units=MAX_UNITS, max_table=MAX_TABLE, max_text=0,
+                                allow_tables=True, allow_text=False)
+
+        if picked2:
+            prompt2, blob2 = build_prompt(company, client_id, missing, picked2)
+            try:
+                out2 = call_claude(prompt2)
+                parsed2 = safe_json_load(out2)
+                raw_fields_2 = parsed2.get("fields", {}) if isinstance(parsed2, dict) else {}
+                pruned2 = prune_fields(raw_fields_2, blob2)
+                for f in missing:
+                    if pruned2.get(f):
+                        final_fields[f] = pruned2[f]
+            except Exception as e:
+                print("  [warn] PASS2 failed:", e)
+
+    # ---------- row output ----------
+    row = {"Company": company, "Client": client_id}
+    for f in FIELDS:
+        row[f] = final_fields.get(f, "")
+    rows_out.append(row)
+
+# save excel
+EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+pd.DataFrame(rows_out).to_excel(EXCEL_PATH, index=False)
+print(f"\n[rag] saved -> {EXCEL_PATH.resolve()}")
