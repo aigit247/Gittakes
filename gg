@@ -1,0 +1,76 @@
+import re
+import json
+import ast
+import pandas as pd
+
+
+def parse_dict_cell(cell) -> dict:
+    """Parse a cell containing a dict-like string into a real dict."""
+    if pd.isna(cell):
+        return {}
+    if isinstance(cell, dict):
+        return cell
+
+    s = str(cell).strip()
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return {}
+
+    # normalize smart quotes
+    s = (s.replace("\u201c", '"').replace("\u201d", '"')
+           .replace("\u2018", "'").replace("\u2019", "'"))
+
+    # fix keys that mistakenly start with ":" like ,:source1":""
+    s = re.sub(r'([{,]\s*):\s*([A-Za-z_]\w*)"\s*:', r'\1"\2":', s)
+    s = re.sub(r"([{,]\s*):\s*([A-Za-z_]\w*)'\s*:", r"\1'\2':", s)
+
+    # try JSON then python literal
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    try:
+        obj = ast.literal_eval(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def clean_key(k: str) -> str:
+    """Convert ':source1' -> 'source1' and strip whitespace."""
+    k = str(k).strip()
+    if k.startswith(":"):
+        k = k[1:].strip()
+    return k
+
+
+# ---------------- CONFIG ----------------
+input_path = "input.xlsx"
+output_path = "output.xlsx"
+sheet_name = 0                    # or "Sheet1"
+extracted_col = "extracted_clauses"
+drop_original_extracted_col = False
+# ---------------------------------------
+
+
+df = pd.read_excel(input_path, sheet_name=sheet_name, engine="openpyxl")
+
+# If column not found, assume last column is the extracted dict column
+if extracted_col not in df.columns:
+    extracted_col = df.columns[-1]
+
+# Parse dict column and normalize keys
+parsed = df[extracted_col].apply(parse_dict_cell)
+parsed = parsed.apply(lambda d: {clean_key(k): v for k, v in (d or {}).items()})
+
+# Expand dict keys into columns automatically (clause1, source1, clause2, source2, ...)
+expanded = pd.json_normalize(parsed)
+
+# Merge back
+if drop_original_extracted_col:
+    df_out = pd.concat([df.drop(columns=[extracted_col]), expanded], axis=1)
+else:
+    df_out = pd.concat([df, expanded], axis=1)
+
+df_out.to_excel(output_path, index=False, engine="openpyxl")
+print(f"Saved: {output_path}")
