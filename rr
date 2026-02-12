@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable, Optional
+from collections import defaultdict
+
+import fitz  # PyMuPDF
+
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+
+from langchain.document_loaders import AmazonTextractPDFLoader  # (not used in this script)
+
+try:
+    from docx import Document as DocxDocument
+    _HAS_PYTHON_DOCX = True
+except Exception:
+    _HAS_PYTHON_DOCX = False
+
+
+# ===================== LOCAL PATH CONFIG =====================
+
+LOCAL_DOC_ROOT = Path("ce").resolve()
+
+CATEGORY_ROOTS: Dict[str, Path] = {
+    "legal":   LOCAL_DOC_ROOT / "legal",
+    "finance": LOCAL_DOC_ROOT / "finance",
+}
+
+FAISS_INDEX_DIR = Path("/opt/ml/faiss_indices").resolve()
+
+# ===================== S3 DOC CONFIG (for Textract) =====================
+
+S3_DOC_BUCKET = "YOUR_SOURCE_DOC_BUCKET"       # TODO: change this
+S3_DOC_PREFIX = "user/d/ce"                    # TODO: adjust to your layout
+
+# ===================== AWS / BEDROCK / TEXTRACT CONFIG =====================
+
+REGION      = os.getenv("AWS_REGION", "us-east-1")
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+import boto3
+from boto3 import Session
+
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    SESSION = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=REGION,
+    )
+else:
+    SESSION = Session(region_name=REGION)
+
+TEXTRACT_CLIENT = SESSION.client("textract")
+
+TEXTRACT_POLL_INTERVAL = 5  # seconds
+
+# ===================== CHUNKING CONFIG =====================
+
+CHUNK_SIZE    = 1200
+CHUNK_OVERLAP = 150
+
+# ===================== PER-FILE HYPERPARAM CONFIG =====================
+
+DEFAULT_K = 4
+DEFAULT_MAX_TOKENS = 2000
+DEFAULT_TEMPERATURE = 0.0
+
+HPARAM_CONFIG_PATH = Path("config/hparam_overrides.json").resolve()
+
+
+def load_hparam_overrides_from_file() -> Dict[str, Dict[str, float]]:
+    if not HPARAM_CONFIG_PATH.exists():
+        print(f"[INFO] No hyperparam config found at {HPARAM_CONFIG_PATH}, using defaults only.")
+        return {}
+
+    try:
+        text = HPARAM_CONFIG_PATH.read_text(encoding="utf-8")
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            print(f"[WARN] Hyperparam config {HPARAM_CONFIG_PATH} must be a JSON object; ignoring.")
+            return {}
+        return data
+    except Exception as e:
+        print(f"[WARN] Failed to load hyperparam config {HPARAM_CONFIG_PATH}: {e}")
+        return {}
+
+
+HPARAM_OVERRIDES: Dict[str, Dict[str, float]] = load_hparam_overrides_from_file()
+
+# ===================== HELPERS =====================
+
+def local_path_to_s3_key(path: Path) -> Optional[str]:
+    try:
+        rel = path.resolve().relative_to(LOCAL_DOC_ROOT.resolve())
+    except ValueError:
+        print(f"[WARN] Path {path} is not under LOCAL_DOC_ROOT {LOCAL_DOC_ROOT}; cannot map to S3 key.")
+        return None
+
+    rel_key = rel.as_posix()
+    if S3_DOC_PREFIX:
+        return f"{S3_DOC_PREFIX.rstrip('/')}/{rel_key}"
+    else:
+        return rel_key
+
+
+def load_metadata_for_file(doc_path: Path) -> Optional[dict]:
+    meta_candidates = [
+        doc_path.with_name(doc_path.name + ".metadata.json"),
+        doc_path.with_name(doc_path.name + ".metadata"),
+    ]
+
+    for meta_path in meta_candidates:
+        if not meta_path.exists():
+            continue
+
+        try:
+            text = meta_path.read_text(encoding="utf-8", errors="ignore").strip()
+            data = json.loads(text)
+        except Exception as e:
+            print(f"[WARN] Failed to read metadata for {doc_path} from {meta_path}: {e}")
+            continue
+
+        meta_block = (
+            data.get("metadataAtrributes")
+            or data.get("metadataAttributes")
+            or data
+        )
+        return meta_block
+
+    return None
+
+
+def clean_text(t: str) -> str:
+    return re.sub(r"[ \t]+\n", "\n", t or "").strip()
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+) -> List[Tuple[int, int, str]]:
+    text = text or ""
+    n = len(text)
+    if n <= chunk_size:
+        return [(0, n, text)]
+    chunks = []
+    start = 0
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end]
+        chunks.append((start, end, chunk))
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+@dataclass
+class DocInfo:
+    policy_id: str
+    source_file: str
+    pages: int
+    modified_time: int
+    metadata: Optional[dict] = None
+    k: int = DEFAULT_K
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+
+
+def get_hparams_for_file(path: Path, metadata: Optional[dict]) -> Dict[str, float]:
+    key = path.name
+    override = HPARAM_OVERRIDES.get(key, {}) or {}
+
+    k = int(override.get("k", DEFAULT_K))
+    max_tokens = int(override.get("max_tokens", DEFAULT_MAX_TOKENS))
+    temperature = float(override.get("temperature", DEFAULT_TEMPERATURE))
+
+    return {
+        "k": k,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+
+def embedder():
+    return BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=SESSION.client("bedrock-runtime")
+    )
+
+# ===================== CLIENT SCAN (LOCAL FOLDERS) =====================
+
+def scan_category_client_files() -> Dict[str, Dict[str, List[Path]]]:
+    out: Dict[str, Dict[str, List[Path]]] = {}
+
+    for category, root in CATEGORY_ROOTS.items():
+        if not root.exists():
+            print(f"[WARN] Category root does not exist: {root}")
+            continue
+
+        cat_map: Dict[str, List[Path]] = {}
+
+        if category == "legal":
+            for client_dir in root.iterdir():
+                if not client_dir.is_dir():
+                    continue
+
+                client_id = client_dir.name.strip().lower()
+
+                pdfs = list(client_dir.rglob("*.pdf"))
+                docs = list(client_dir.rglob("*.doc")) + list(client_dir.rglob("*.docx"))
+                files = sorted(pdfs + docs, key=lambda p: p.name.lower())
+
+                if not files:
+                    continue
+
+                cat_map.setdefault(client_id, []).extend(files)
+
+        elif category == "finance":
+            for client_dir in root.iterdir():
+                if not client_dir.is_dir():
+                    continue
+
+                for sub_dir in client_dir.rglob("*"):
+                    if not sub_dir.is_dir():
+                        continue
+
+                    rel = sub_dir.relative_to(root)
+                    if str(rel) == client_dir.name:
+                        continue
+
+                    client_id = rel.as_posix()
+
+                    pdfs = list(sub_dir.glob("*.pdf"))
+                    docs = list(sub_dir.glob("*.doc")) + list(sub_dir.glob("*.docx"))
+                    files = sorted(pdfs + docs, key=lambda p: p.name.lower())
+
+                    if not files:
+                        continue
+
+                    cat_map.setdefault(client_id, []).extend(files)
+
+        if cat_map:
+            out[category] = cat_map
+
+    return out
+
+
+# ===================== SCANNED PDF DETECTION & TEXTRACT =====================
+
+def is_scanned_pdf(pdf_path: Path, sample_pages: int = 3, char_threshold: int = 50) -> bool:
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            n_pages = doc.page_count
+            if n_pages == 0:
+                return True
+            to_sample = min(n_pages, sample_pages)
+            total_chars = 0
+            for i in range(to_sample):
+                page = doc.load_page(i)
+                txt = page.get_text("text") or ""
+                total_chars += len(txt.strip())
+            return total_chars < char_threshold * to_sample
+    except Exception as e:
+        print(f"[WARN] Failed to inspect {pdf_path} for scanned detection: {e}")
+        return True
+
+
+def textract_start_job(bucket: str, key: str) -> Optional[str]:
+    try:
+        resp = TEXTRACT_CLIENT.start_document_text_detection(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}}
+        )
+        job_id = resp["JobId"]
+        print(f"[TEXTRACT] Started job {job_id} for s3://{bucket}/{key}")
+        return job_id
+    except Exception as e:
+        print(f"[WARN] Failed to start Textract job for s3://{bucket}/{key}: {e}")
+        return None
+
+
+def textract_wait_for_job(job_id: str) -> bool:
+    while True:
+        try:
+            resp = TEXTRACT_CLIENT.get_document_text_detection(
+                JobId=job_id,
+                MaxResults=1
+            )
+        except Exception as e:
+            print(f"[WARN] get_document_text_detection failed for JobId {job_id}: {e}")
+            return False
+
+        status = resp.get("JobStatus")
+        if status == "SUCCEEDED":
+            print(f"[TEXTRACT] Job {job_id} SUCCEEDED")
+            return True
+        if status in ("FAILED", "PARTIAL_SUCCESS"):
+            print(f"[WARN] Textract job {job_id} ended with status {status}")
+            return False
+
+        print(f"[TEXTRACT] Job {job_id} status {status}, waiting...")
+        time.sleep(TEXTRACT_POLL_INTERVAL)
+
+
+def textract_collect_blocks(job_id: str) -> List[dict]:
+    blocks: List[dict] = []
+    next_token: Optional[str] = None
+
+    while True:
+        kwargs = {"JobId": job_id, "MaxResults": 1000}
+        if next_token:
+            kwargs["NextToken"] = next_token
+
+        resp = TEXTRACT_CLIENT.get_document_text_detection(**kwargs)
+        blocks.extend(resp.get("Blocks", []))
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+
+    return blocks
+
+
+def textract_pdf_to_page_texts_s3(pdf_path: Path) -> List[Tuple[int, str]]:
+    s3_key = local_path_to_s3_key(pdf_path)
+    if not s3_key:
+        return []
+
+    job_id = textract_start_job(S3_DOC_BUCKET, s3_key)
+    if not job_id:
+        return []
+
+    if not textract_wait_for_job(job_id):
+        return []
+
+    blocks = textract_collect_blocks(job_id)
+    if not blocks:
+        return []
+
+    page_lines: Dict[int, List[str]] = defaultdict(list)
+    for b in blocks:
+        if b.get("BlockType") == "LINE":
+            text = (b.get("Text") or "").strip()
+            if not text:
+                continue
+            page_num = int(b.get("Page") or 1)
+            page_lines[page_num].append(text)
+
+    page_texts: List[Tuple[int, str]] = []
+    for page_num in sorted(page_lines.keys()):
+        combined = "\n".join(page_lines[page_num])
+        combined = clean_text(combined)
+        if combined.strip():
+            page_texts.append((page_num, combined))
+
+    return page_texts
+
+
+# ===================== CHUNKING FOR FILE TYPES =====================
+
+def make_chunks_for_pdf(pdf_path: Path, category: str, client_id: str) -> Iterable[Document]:
+    page_texts: List[Tuple[int, str]] = []
+
+    scanned = is_scanned_pdf(pdf_path)
+    if scanned:
+        print(f"[PDF] {pdf_path} appears scanned, using Textract via S3")
+        page_texts = textract_pdf_to_page_texts_s3(pdf_path)
+    else:
+        try:
+            with fitz.open(str(pdf_path)) as doc:
+                for i in range(doc.page_count):
+                    txt = clean_text(doc.load_page(i).get_text("text") or "")
+                    if txt.strip():
+                        page_texts.append((i + 1, txt))
+        except Exception as e:
+            print(f"[WARN] Failed to read PDF {pdf_path} with PyMuPDF: {e}")
+            page_texts = textract_pdf_to_page_texts_s3(pdf_path)
+
+    if not page_texts:
+        print(f"[WARN] No text found for PDF {pdf_path}")
+        return
+
+    combined = ""
+    page_ranges: List[Tuple[int, int, int]] = []
+    cursor = 0
+
+    for page_num, txt in page_texts:
+        start = cursor
+        combined += txt + "\n"
+        cursor = len(combined)
+        page_ranges.append((start, cursor, page_num))
+
+    for c_start, c_end, chunk in chunk_text(combined):
+        pages = sorted({
+            page_num
+            for p_start, p_end, page_num in page_ranges
+            if not (p_end <= c_start or p_start >= c_end)
+        })
+        if not pages:
+            continue
+
+        meta = {
+            "category": category,
+            "client_id": client_id,
+            "policy_id": pdf_path.name,
+            "page_start": pages[0],
+            "page_end": pages[-1],
+            "source_file": str(pdf_path.resolve()),
+            "extracted_by": "pymupdf_or_textract",
+        }
+        yield Document(page_content=chunk, metadata=meta)
+
+
+def make_chunks_for_docx(doc_path: Path, category: str, client_id: str) -> Iterable[Document]:
+    if not _HAS_PYTHON_DOCX:
+        print(f"[WARN] python-docx not available; skipping {doc_path}")
+        return
+
+    if doc_path.suffix.lower() != ".docx":
+        print(f"[WARN] Skipping non-DOCX file in DOCX handler: {doc_path}")
+        return
+
+    policy_id = doc_path.name
+    print(f"[DEBUG] Starting DOCX extraction for {doc_path}")
+
+    try:
+        doc = DocxDocument(str(doc_path))
+    except Exception as e:
+        print(f"[WARN] Failed to open DOCX {doc_path} with python-docx: {e}")
+        return
+
+    texts = []
+    for para in doc.paragraphs:
+        t = (para.text or "").strip()
+        if t:
+            texts.append(t)
+
+    full_text = "\n".join(texts).strip()
+    if not full_text:
+        print(f"[DEBUG] No text found in DOCX {doc_path}")
+        return
+
+    chunks = chunk_text(full_text)
+    print(f"[DEBUG] Generated {len(chunks)} chunks for DOCX {doc_path}")
+
+    for logical_page, (_, _, chunk) in enumerate(chunks, start=1):
+        meta = {
+            "category": category,
+            "client_id": client_id,
+            "policy_id": policy_id,
+            "page": logical_page,
+            "source_file": str(doc_path.resolve()),
+            "extracted_by": "python-docx",
+        }
+        yield Document(page_content=chunk, metadata=meta)
+
+
+def make_chunks_for_file(path: Path, category: str, client_id: str) -> Iterable[Document]:
+    suf = path.suffix.lower()
+    if suf == ".pdf":
+        yield from make_chunks_for_pdf(path, category, client_id)
+    elif suf in (".doc", ".docx"):
+        yield from make_chunks_for_docx(path, category, client_id)
+    else:
+        print(f"[INFO] Skipping unsupported file type: {path}")
+
+
+def build_manifest_entry(path: Path) -> DocInfo:
+    pages = 0
+    if path.suffix.lower() == ".pdf":
+        try:
+            with fitz.open(str(path)) as doc:
+                pages = doc.page_count
+        except Exception:
+            pages = 0
+
+    stat = path.stat()
+    meta = load_metadata_for_file(path)
+
+    hparams = get_hparams_for_file(path, meta)
+
+    return DocInfo(
+        policy_id=path.name,
+        source_file=str(path.resolve()),
+        pages=pages,
+        modified_time=int(stat.st_mtime),
+        metadata=meta,
+        k=hparams["k"],
+        max_tokens=hparams["max_tokens"],
+        temperature=hparams["temperature"],
+    )
+
+
+# ===================== INDEX BUILDING =====================
+
+def index_client(category: str, client_id: str, files: List[Path]) -> None:
+    client_dir = FAISS_INDEX_DIR / category / client_id
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    docs: List[Document] = []
+    manifest_rows: List[DocInfo] = []
+
+    for path in files:
+        print(f"[{category}/{client_id}] Processing {path}")
+
+        # Build manifest entry ONCE and reuse it to stamp every chunk
+        m = build_manifest_entry(path)
+        manifest_rows.append(m)
+
+        file_meta = m.metadata or {}
+
+        for doc in make_chunks_for_file(path, category, client_id):
+            # ✅ ensure dict metadata ALWAYS
+            if not isinstance(getattr(doc, "metadata", None), dict):
+                doc.metadata = {}
+
+            # ✅ stamp canonical identity from manifest (do not rely on chunker)
+            doc.metadata["category"] = category
+            doc.metadata["client_id"] = client_id
+            doc.metadata["policy_id"] = m.policy_id
+            doc.metadata["source_file"] = m.source_file
+
+            # ✅ attach per-file metadata (nested to avoid collisions)
+            if file_meta:
+                doc.metadata["file_metadata"] = file_meta
+
+            docs.append(doc)
+
+    if not docs:
+        print(f"[{category}/{client_id}] No extractable text; skipping index.")
+        return
+
+    # ✅ sanity check (catches the "metadata None" issue before FAISS build)
+    bad = [d for d in docs if not isinstance(getattr(d, "metadata", None), dict)]
+    print(f"[DEBUG] total_chunks={len(docs)} chunks_with_bad_metadata={len(bad)}")
+    if bad:
+        print("[DEBUG] example bad chunk metadata:", getattr(bad[0], "metadata", None))
+        raise SystemExit("Some chunks still have missing/invalid metadata; fix chunk creation/stamping.")
+
+    print(f"[{category}/{client_id}] Building FAISS with {len(docs)} chunks…")
+    vs = FAISS.from_documents(docs, embedder())
+    vs.save_local(str(client_dir))
+
+    manifest = {
+        "category": category,
+        "client_id": client_id,
+        "docs": [
+            {
+                "policy_id": m.policy_id,
+                "source_file": m.source_file,
+                "pages": m.pages,
+                "modified_time": m.modified_time,
+                "metadata": m.metadata,
+                "k": m.k,
+                "max_tokens": m.max_tokens,
+                "temperature": m.temperature,
+            }
+            for m in manifest_rows
+        ],
+        "generated_time": int(time.time()),
+    }
+
+    (client_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(f"[{category}/{client_id}] Done. Index at {client_dir}")
+
+
+# ===================== ENTRYPOINT =====================
+
+def main():
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    by_cat_client = scan_category_client_files()
+    if not by_cat_client:
+        print("No files (PDF/DOC/DOCX) found under any category root.")
+        return
+
+    for category, clients in by_cat_client.items():
+        for client_id, files in clients.items():
+            print(f"\n==== Indexing {category}/{client_id} with {len(files)} file(s) ====")
+            index_client(category, client_id, files)
+
+
+if __name__ == "__main__":
+    main()
