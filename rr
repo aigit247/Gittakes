@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import boto3
+import pandas as pd
+
+
+# ----------------- name normalization (same as MetadataService style) -----------------
+
+_LEGAL_SUFFIX_TOKENS = {"inc", "ltd", "llc", "plc", "as", "sa", "ag", "gmbh", "bv", "nv", "s"}
+
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def canonicalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return _clean_spaces(s)
+
+def canonicalize_compact(s: str) -> str:
+    return canonicalize_name(s).replace(" ", "")
+
+def acronym(name: str) -> str:
+    toks = canonicalize_name(name).split()
+    while toks and toks[-1] in _LEGAL_SUFFIX_TOKENS:
+        toks.pop()
+    return "".join(t[0] for t in toks).upper() if toks else ""
+
+def normalize_id(v: Any) -> str:
+    s = "" if v is None else str(v).strip()
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s
+
+# ----------------- s3 helpers -----------------
+
+def _is_s3_uri(s: str) -> bool:
+    return isinstance(s, str) and s.lower().startswith("s3://")
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    u = urlparse((uri or "").strip())
+    bucket = (u.netloc or "").strip()
+    key = (u.path or "").lstrip("/")
+    if not bucket or not key:
+        raise ValueError(f"Invalid S3 URI (need s3://bucket/key): {uri}")
+    return bucket, key
+
+def _read_master(path: str, s3_client) -> pd.DataFrame:
+    if _is_s3_uri(path):
+        b, k = _parse_s3_uri(path)
+        obj = s3_client.get_object(Bucket=b, Key=k)
+        data = obj["Body"].read()
+        lk = k.lower()
+        if lk.endswith(".csv"):
+            return pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False)
+        if lk.endswith(".xlsx") or lk.endswith(".xls"):
+            return pd.read_excel(io.BytesIO(data), dtype=str, keep_default_na=False)
+        raise ValueError("Master must be .csv/.xlsx/.xls")
+    else:
+        lk = path.lower()
+        if lk.endswith(".csv"):
+            return pd.read_csv(path, dtype=str, keep_default_na=False)
+        if lk.endswith(".xlsx") or lk.endswith(".xls"):
+            return pd.read_excel(path, dtype=str, keep_default_na=False)
+        raise ValueError("Master must be .csv/.xlsx/.xls")
+
+# ----------------- build mapping -----------------
+
+def build_map(df: pd.DataFrame, name_col: str, capid_col: str) -> Dict[str, Any]:
+    df.columns = [str(c).strip() for c in df.columns]
+    if name_col not in df.columns:
+        raise ValueError(f"Missing name_col={name_col!r} in master")
+    if capid_col not in df.columns:
+        raise ValueError(f"Missing capid_col={capid_col!r} in master")
+
+    by_canon: Dict[str, List[str]] = {}
+    by_compact: Dict[str, List[str]] = {}
+    by_acronym: Dict[str, List[str]] = {}
+    rows: List[Dict[str, str]] = []
+
+    for _, r in df.iterrows():
+        name = str(r.get(name_col) or "").strip()
+        capid = normalize_id(r.get(capid_col))
+        if not name or not capid:
+            continue
+
+        cn = canonicalize_name(name)
+        cc = canonicalize_compact(name)
+        ac = acronym(name)
+
+        if cn:
+            by_canon.setdefault(cn, [])
+            if capid not in by_canon[cn]:
+                by_canon[cn].append(capid)
+        if cc:
+            by_compact.setdefault(cc, [])
+            if capid not in by_compact[cc]:
+                by_compact[cc].append(capid)
+        if ac:
+            by_acronym.setdefault(ac, [])
+            if capid not in by_acronym[ac]:
+                by_acronym[ac].append(capid)
+
+        rows.append({"name": name, "canon": cn, "compact": cc, "acronym": ac, "capid": capid})
+
+    return {
+        "version": 1,
+        "name_col": name_col,
+        "capid_col": capid_col,
+        "by_canon": by_canon,
+        "by_compact": by_compact,
+        "by_acronym": by_acronym,
+        "rows": rows,
+    }
+
+def write_json(out_path: str, payload: Dict[str, Any], s3_client) -> None:
+    data = json.dumps(payload, indent=2).encode("utf-8")
+    if _is_s3_uri(out_path):
+        b, k = _parse_s3_uri(out_path)
+        s3_client.put_object(Bucket=b, Key=k, Body=data, ContentType="application/json")
+        print(f"[OK] wrote {out_path}")
+    else:
+        with open(out_path, "wb") as f:
+            f.write(data)
+        print(f"[OK] wrote {out_path}")
+
+def main():
+    master = os.getenv("CLIENT_MASTER_PATH", "").strip()
+    out = os.getenv("CLIENT_CAPID_MAP_OUT", "client_capid_map.json").strip()
+    name_col = os.getenv("MASTER_CLIENT_NAME_COL", "parent_hq_legal_account_name_c").strip()
+    capid_col = os.getenv("MASTER_CAPID_COL", "cid").strip()
+    region = os.getenv("AWS_REGION", "us-east-1")
+
+    if not master:
+        raise SystemExit("CLIENT_MASTER_PATH is required")
+
+    session = boto3.Session(region_name=region)
+    s3 = session.client("s3", region_name=region)
+
+    df = _read_master(master, s3)
+    payload = build_map(df, name_col=name_col, capid_col=capid_col)
+    write_json(out, payload, s3)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
