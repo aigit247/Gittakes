@@ -1,0 +1,18 @@
+import os, hmac, hashlib
+import pandas as pd
+
+MASK_KEY = os.environ.get("MASK_KEY", "demo-secret").encode()
+SENSITIVE_COLS = {"Lanyon ID", "ClientName", "Client Name"}
+
+def hmac_token(v: object, keep_last: int = 4) -> str:
+    s = "" if pd.isna(v) else str(v)
+    h = hmac.new(MASK_KEY, s.encode(), hashlib.sha256).hexdigest()[:10]
+    tail = s[-keep_last:] if len(s) >= keep_last else s
+    return f"{tail}-{h}"   # e.g. 1234-a1b2c3d4e5
+
+def mask_df_for_ui(df: pd.DataFrame) -> pd.DataFrame:
+    ui = df.copy()
+    for col in ui.columns:
+        if col in SENSITIVE_COLS:
+            ui[col] = ui[col].apply(hmac_token)
+    return ui
