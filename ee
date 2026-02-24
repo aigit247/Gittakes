@@ -1,0 +1,1448 @@
+# indexer.py
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable, Optional
+
+import fitz  # PyMuPDF
+
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+
+# Textract loader
+from langchain_community.document_loaders import AmazonTextractPDFLoader
+
+try:
+    from docx import Document as DocxDocument
+    _HAS_PYTHON_DOCX = True
+except Exception:
+    _HAS_PYTHON_DOCX = False
+
+import boto3
+from boto3 import Session
+
+
+def _make_session(region: str, profile_env: str, role_arn_env: str, session_name: str) -> Session:
+    """
+    Minimal helper to create a boto3 session with optional profile + optional assume-role.
+    Uses AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY if provided.
+    """
+    profile = (os.getenv(profile_env) or "").strip()
+    role_arn = (os.getenv(role_arn_env) or "").strip()
+
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        base = Session(
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=region,
+            profile_name=profile or None,
+        )
+    else:
+        base = Session(region_name=region, profile_name=profile or None)
+
+    if not role_arn:
+        return base
+
+    sts = base.client("sts", region_name=region)
+    creds = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)["Credentials"]
+    return Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=region,
+    )
+
+# ===================== LOCAL PATH CONFIG =====================
+
+LOCAL_DOC_ROOT = Path("ce").resolve()
+
+# CHANGE: finance -> COLA
+CATEGORY_ROOTS: Dict[str, Path] = {
+    "legal": LOCAL_DOC_ROOT / "legal",
+    "cola":  LOCAL_DOC_ROOT / "cola",
+}
+
+FAISS_INDEX_DIR = Path("/opt/ml/faiss_indices").resolve()
+
+# ===================== S3 DOC CONFIG (for Textract) =====================
+
+S3_DOC_BUCKET = "YOUR_SOURCE_DOC_BUCKET"  # TODO
+S3_DOC_PREFIX = "user/d/ce"               # TODO
+
+# ===================== AWS / BEDROCK / TEXTRACT CONFIG =====================
+
+REGION = os.getenv("AWS_REGION", "us-east-1")
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+# --- Two sessions: one for Textract/S3, one for Bedrock ---
+TEXTRACT_SESSION = _make_session(REGION, "AWS_PROFILE_S3", "AWS_ROLE_ARN_S3", "indexer-s3")
+BEDROCK_SESSION  = _make_session(REGION, "AWS_PROFILE_BEDROCK", "AWS_ROLE_ARN_BEDROCK", "indexer-bedrock")
+
+TEXTRACT_CLIENT  = TEXTRACT_SESSION.client("textract")
+BEDROCK_RUNTIME  = BEDROCK_SESSION.client("bedrock-runtime")
+
+# Keep SESSION name for backward compatibility in this module.
+SESSION = TEXTRACT_SESSION
+
+TEXTRACT_POLL_INTERVAL = 5
+
+# ===================== CHUNKING CONFIG =====================
+
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+
+# ===================== HELPERS =====================
+
+def clean_text(t: str) -> str:
+    """Light cleanup; keep punctuation and newlines."""
+    return re.sub(r"[ \t]+\n", "\n", t or "").strip()
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int, str]]:
+    """
+    Split `text` into chunks with overlap.
+    Returns list of (start_idx, end_idx, chunk_text).
+    """
+    text = text or ""
+    n = len(text)
+    if n <= chunk_size:
+        return [(0, n, text)]
+    chunks = []
+    start = 0
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end]
+        chunks.append((start, end, chunk))
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+# ===================== METADATA SIDE-CAR LOADER (NEW) =====================
+
+def load_metadata_for_file(doc_path: Path) -> Optional[dict]:
+    """
+    Given a document path like:
+      /.../deal1.pdf
+    we look for:
+      /.../deal1.pdf.metadata.json
+    or (fallback)
+      /.../deal1.pdf.metadata
+
+    We then return the metadataAtrributes block (preferred),
+    or the whole JSON if that key is missing.
+    """
+    meta_candidates = [
+        doc_path.with_name(doc_path.name + ".metadata.json"),
+        doc_path.with_name(doc_path.name + ".metadata"),
+    ]
+
+    for meta_path in meta_candidates:
+        if not meta_path.exists():
+            continue
+        try:
+            text = meta_path.read_text(encoding="utf-8", errors="ignore").strip()
+            data = json.loads(text)
+        except Exception as e:
+            print(f"[WARN] Failed to read metadata for {doc_path} from {meta_path}: {e}")
+            continue
+
+        # normalize spelling variant
+        meta_block = (
+            data.get("metadataAtrributes")
+            or data.get("metadataAttributes")
+            or data
+        )
+        return meta_block
+
+    return None
+
+# ===================== LOCAL → S3 KEY MAPPING =====================
+
+def local_path_to_s3_key(path: Path) -> Optional[str]:
+    """
+    Map a local path under LOCAL_DOC_ROOT to the S3 key used for Textract.
+    """
+    try:
+        rel = path.resolve().relative_to(LOCAL_DOC_ROOT.resolve())
+    except ValueError:
+        print(f"[WARN] Path {path} is not under LOCAL_DOC_ROOT {LOCAL_DOC_ROOT}; cannot map to S3 key.")
+        return None
+
+    rel_key = rel.as_posix()
+    if S3_DOC_PREFIX:
+        return f"{S3_DOC_PREFIX.rstrip('/')}/{rel_key}"
+    else:
+        return rel_key
+
+# ===================== SCANNED PDF DETECTION =====================
+
+def is_scanned_pdf(pdf_path: Path, sample_pages: int = 3, char_threshold: int = 50) -> bool:
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            n_pages = doc.page_count
+            if n_pages == 0:
+                return True
+            to_sample = min(n_pages, sample_pages)
+            total_chars = 0
+            for i in range(to_sample):
+                page = doc.load_page(i)
+                txt = page.get_text("text") or ""
+                total_chars += len(txt.strip())
+            return total_chars < char_threshold * to_sample
+    except Exception as e:
+        print(f"[WARN] Failed to inspect {pdf_path} for scanned detection: {e}")
+        return True
+
+# ===================== TEXTRACT LOADER (S3 URI) =====================
+
+def textract_by_pages(
+    s3_uri: str,
+    client=None,
+    textract_features: Optional[List[str]] = None,
+    region_name: Optional[str] = None,
+) -> List[Tuple[int, str]]:
+    try:
+        loader = AmazonTextractPDFLoader(
+            file_path=s3_uri,
+            client=client,
+            textract_features=textract_features,
+            region_name=region_name,
+        )
+        docs = loader.load()
+    except Exception as e:
+        print(f"[WARN] textract_by_pages loader failed for {s3_uri}: {e}")
+        return []
+
+    page_texts: List[Tuple[int, str]] = []
+    for d in docs:
+        if d is None:
+            continue
+        text = clean_text(getattr(d, "page_content", "") or "")
+        if not text:
+            continue
+        meta = getattr(d, "metadata", {}) or {}
+        page = meta.get("page") or meta.get("Page") or 1
+        try:
+            page_num = int(page)
+        except Exception:
+            page_num = 1
+        page_texts.append((page_num, text))
+
+    page_texts.sort(key=lambda x: x[0])
+    return page_texts
+
+# ===================== EXTRACTION / CHUNKING =====================
+
+def make_chunks_for_pdf(pdf_path: Path, category: str, client_id: str, policy_id: str, doc_meta: Optional[dict]) -> Iterable[Document]:
+    # normal text extraction via PyMuPDF; fallback to Textract if scanned
+    if is_scanned_pdf(pdf_path):
+        s3_key = local_path_to_s3_key(pdf_path)
+        if not s3_key:
+            return
+        s3_uri = f"s3://{S3_DOC_BUCKET}/{s3_key}"
+        page_texts = textract_by_pages(s3_uri, client=TEXTRACT_CLIENT, region_name=REGION)
+        if not page_texts:
+            print(f"[WARN] Empty text after Textract loader for {pdf_path}")
+            return
+
+        # concatenate with page ranges
+        page_ranges: List[Tuple[int, int, int]] = []
+        concatenated = ""
+        cursor = 0
+        for page_num, page_text in page_texts:
+            t = page_text.strip()
+            if not t:
+                continue
+            start = cursor
+            concatenated += t + "\n"
+            cursor = len(concatenated)
+            end = cursor
+            page_ranges.append((start, end, page_num))
+
+        concatenated = concatenated.strip()
+        if not concatenated:
+            return
+
+        for c_start, c_end, chunk in chunk_text(concatenated):
+            pages = sorted({
+                page_num
+                for p_start, p_end, page_num in page_ranges
+                if not (p_end <= c_start or p_start >= c_end)
+            })
+            if not pages:
+                continue
+
+            meta = {
+                "category": category,
+                "client_id": client_id,
+                "policy_id": policy_id,
+                "page_start": pages[0],
+                "page_end": pages[-1],
+                "source_file": str(pdf_path.resolve()),
+                "extracted_by": "amazon_textract_loader",
+            }
+            # NEW: attach doc-level metadata chunk-wise
+            if isinstance(doc_meta, dict):
+                meta["metadataAttributes"] = doc_meta
+
+            yield Document(page_content=chunk, metadata=meta)
+        return
+
+    # non-scanned: PyMuPDF page text
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            for i in range(doc.page_count):
+                txt = clean_text(doc.load_page(i).get_text("text") or "")
+                if not txt:
+                    continue
+                for _, __, chunk in chunk_text(txt):
+                    meta = {
+                        "category": category,
+                        "client_id": client_id,
+                        "policy_id": policy_id,
+                        "page": i + 1,
+                        "source_file": str(pdf_path.resolve()),
+                        "extracted_by": "pymupdf",
+                    }
+                    # NEW: attach doc-level metadata chunk-wise
+                    if isinstance(doc_meta, dict):
+                        meta["metadataAttributes"] = doc_meta
+
+                    yield Document(page_content=chunk, metadata=meta)
+    except Exception as e:
+        print(f"[WARN] Failed to read PDF {pdf_path}: {e}")
+        return
+
+def make_chunks_for_docx(doc_path: Path, category: str, client_id: str, policy_id: str, doc_meta: Optional[dict]) -> Iterable[Document]:
+    if not _HAS_PYTHON_DOCX:
+        print(f"[WARN] python-docx not available; skipping {doc_path}")
+        return
+
+    try:
+        doc = DocxDocument(str(doc_path))
+    except Exception as e:
+        print(f"[WARN] Failed to open DOCX {doc_path} with python-docx: {e}")
+        return
+
+    texts = []
+    for para in doc.paragraphs:
+        t = (para.text or "").strip()
+        if t:
+            texts.append(t)
+
+    full_text = "\n".join(texts).strip()
+    if not full_text:
+        return
+
+    chunks = chunk_text(full_text)
+    for logical_page, (_, __, chunk) in enumerate(chunks, start=1):
+        meta = {
+            "category": category,
+            "client_id": client_id,
+            "policy_id": policy_id,
+            "page": logical_page,
+            "source_file": str(doc_path.resolve()),
+            "extracted_by": "python-docx",
+        }
+        # NEW: attach doc-level metadata chunk-wise
+        if isinstance(doc_meta, dict):
+            meta["metadataAttributes"] = doc_meta
+
+        yield Document(page_content=chunk, metadata=meta)
+
+def make_chunks_for_file(path: Path, category: str, client_id: str, group_id: str, scope_dir: str) -> Iterable[Document]:
+    policy_id = path.name
+
+    # NEW: load metadata ONCE per file and pass into chunk generation
+    doc_meta = load_metadata_for_file(path)
+
+    suf = path.suffix.lower()
+    if suf == ".pdf":
+        yield from make_chunks_for_pdf(path, category, client_id, policy_id, doc_meta)
+    elif suf in (".doc", ".docx"):
+        yield from make_chunks_for_docx(path, category, client_id, policy_id, doc_meta)
+    else:
+        print(f"[INFO] Skipping unsupported file type: {path}")
+
+def embedder():
+    return BedrockEmbeddings(model_id=EMBED_MODEL, client=BEDROCK_RUNTIME)
+
+# ===================== TASK SCAN (LOCAL FOLDERS) =====================
+
+def scan_tasks() -> List[Tuple[str, str, str, List[Path]]]:
+    """
+    Returns list of:
+      (category, client_folder, scope_input, files)
+
+    - legal: client_folder is client name folder; scope_input = ""
+    - cola : client_folder is top-level client folder; scope_input comes from subfolder name rules (unchanged)
+    """
+    tasks: List[Tuple[str, str, str, List[Path]]] = []
+
+    for category, root in CATEGORY_ROOTS.items():
+        if not root.exists():
+            print(f"[WARN] Category root does not exist: {root}")
+            continue
+
+        if category == "legal":
+            for client_dir in root.iterdir():
+                if not client_dir.is_dir():
+                    continue
+                client_folder = client_dir.name.strip()
+                pdfs = list(client_dir.rglob("*.pdf"))
+                docs = list(client_dir.rglob("*.doc")) + list(client_dir.rglob("*.docx"))
+                files = sorted(pdfs + docs, key=lambda p: p.name.lower())
+                if not files:
+                    continue
+                tasks.append((category, client_folder, "", files))
+
+        elif category == "cola":
+            # cola (mirror old finance behavior: ce/cola/<client>/<scope>/...)
+            for client_dir in root.iterdir():
+                if not client_dir.is_dir():
+                    continue
+                client_folder = client_dir.name.strip()
+                for scope_dir in client_dir.iterdir():
+                    if not scope_dir.is_dir():
+                        continue
+                    scope_input = scope_dir.name.strip()  # "US" / "Ultimate Parent" / "Corporate Family"
+                    pdfs = list(scope_dir.rglob("*.pdf"))
+                    docs = list(scope_dir.rglob("*.doc")) + list(scope_dir.rglob("*.docx"))
+                    files = sorted(pdfs + docs, key=lambda p: p.name.lower())
+                    if not files:
+                        continue
+                    tasks.append((category, client_folder, scope_input, files))
+
+    return tasks
+
+# ===================== CLIENT->GROUP MAPPER (UNCHANGED IMPORT STYLE) =====================
+
+from services.metadata_service import ClientGroupMapper  # keep existing wiring
+
+CLIENT_GROUP_XLSX_PATH = (os.getenv("CLIENT_GROUP_XLSX_PATH") or "").strip()
+
+def index_task(mapper: ClientGroupMapper, category: str, client_folder: str, scope_input: str, files: List[Path]) -> None:
+    resolved = mapper.resolve_group_row(client_folder, scope_input)
+    row = resolved[0] if isinstance(resolved, tuple) else resolved
+    if not row:
+        print(f"[SKIP] No mapping for client='{client_folder}' scope='{scope_input}' category='{category}'")
+        return
+
+    group_id = row.group_id
+    scope_dir = row.scope_dir
+
+    out_dir = FAISS_INDEX_DIR / category / group_id / scope_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    docs: List[Document] = []
+    manifest_docs = []
+
+    for path in files:
+        for d in make_chunks_for_file(path, category, client_folder, group_id, scope_dir):
+            docs.append(d)
+
+        # NEW: manifest doc entries now include metadataAttributes (doc-level)
+        doc_meta = load_metadata_for_file(path)
+        manifest_docs.append(
+            {
+                "policy_id": path.name,
+                "source_file": str(path.resolve()),
+                "modified_time": int(path.stat().st_mtime),
+                "metadata": doc_meta,  # matches old-code behavior (doc metadata stored in manifest)
+            }
+        )
+
+    if not docs:
+        print(f"[{category}/{client_folder}/{scope_dir}] No extractable text; skipping.")
+        return
+
+    print(f"[{category}/{client_folder}/{scope_dir}] Building FAISS with {len(docs)} chunks...")
+    vs = FAISS.from_documents(docs, embedder())
+    vs.save_local(str(out_dir))
+
+    manifest = {
+        "category": category,
+        "client_folder": client_folder,
+        "group_id": group_id,
+        "scope_input": scope_input,
+        "scope_dir": scope_dir,
+        "docs": manifest_docs,
+        "generated_time": int(time.time()),
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[{category}/{client_folder}/{scope_dir}] Done. Index at {out_dir}")
+
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--client-folder", default=os.getenv("TARGET_CLIENT_FOLDER", "").strip())
+    p.add_argument("--scope", default=os.getenv("TARGET_SCOPE", "").strip())
+    p.add_argument("--category", default=os.getenv("TARGET_CATEGORY", "").strip().lower())
+    return p.parse_args()
+
+def main():
+    if not CLIENT_GROUP_XLSX_PATH:
+        raise RuntimeError("CLIENT_GROUP_XLSX_PATH is required")
+
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    s3 = SESSION.client("s3")
+    mapper = ClientGroupMapper(CLIENT_GROUP_XLSX_PATH)
+    mapper.load(s3)
+
+    args = _parse_args()
+    tasks = scan_tasks()
+
+    if args.client_folder:
+        tasks = [t for t in tasks if t[1] == args.client_folder]
+
+    # CHANGE: category filters now use cola/legal
+    if args.category in {"legal", "cola"}:
+        tasks = [t for t in tasks if t[0] == args.category]
+
+    if args.scope:
+        tasks = [t for t in tasks if t[2] == args.scope]
+
+    if not tasks:
+        print("No tasks found after filtering.")
+        return
+
+    for category, client_folder, scope_input, files in tasks:
+        index_task(mapper, category, client_folder, scope_input, files)
+
+if __name__ == "__main__":
+    main()
+
+
+  ###
+
+
+  # services/metadata_service.py
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import boto3
+import pandas as pd
+
+# =========================
+# Text helpers
+# =========================
+
+_LEGAL_SUFFIX_TOKENS = {"inc", "ltd", "llc", "plc", "as", "sa", "ag", "gmbh", "bv", "nv", "s"}
+
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def canonicalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return _clean_spaces(s)
+
+def canonicalize_compact(s: str) -> str:
+    return canonicalize_name(s).replace(" ", "")
+
+def acronym(name: str) -> str:
+    toks = canonicalize_name(name).split()
+    while toks and toks[-1] in _LEGAL_SUFFIX_TOKENS:
+        toks.pop()
+    return "".join(t[0] for t in toks).upper() if toks else ""
+
+def normalize_country(country: Optional[str]) -> Optional[str]:
+    if not country:
+        return None
+    c = str(country).strip().upper()
+
+    if c in {"UNITED STATES", "U.S.", "U.S", "US", "USA"}:
+        return "US"
+    if c in {"UNITED KINGDOM", "GREAT BRITAIN", "GB", "UK"}:
+        return "UK"
+    if c in {"INDIA", "IN", "IND"}:
+        return "IN"
+    return c or None
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    p = urlparse(uri)
+    if p.scheme != "s3":
+        raise ValueError(f"Not an s3 URI: {uri}")
+    bucket = p.netloc
+    key = (p.path or "").lstrip("/")
+    return bucket, key
+
+def _join_key(*parts: str) -> str:
+    return "/".join([p.strip("/").strip() for p in parts if str(p or "").strip()])
+
+def _s3_uri(bucket: str, key: str) -> str:
+    return f"s3://{bucket}/{key.lstrip('/')}"
+
+def _make_session(region: str, profile_env: str, role_arn_env: str, session_name: str):
+    profile = (os.getenv(profile_env) or "").strip()
+    role_arn = (os.getenv(role_arn_env) or "").strip()
+
+    if profile:
+        base = boto3.Session(profile_name=profile, region_name=region)
+    else:
+        base = boto3.Session(region_name=region)
+
+    if role_arn:
+        sts = base.client("sts", region_name=region)
+        creds = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)["Credentials"]
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+            region_name=region,
+        )
+    return base
+
+
+def _norm_col(c: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(c or "").lower())
+
+def _canonicalize_xlsx_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename ONLY two columns (leave all others unchanged):
+      - "client Name (as in xxx)" -> clientName
+      - "Group (corporate+ulitmate_parent)" -> groupid
+    """
+    norm_to_actual = {_norm_col(c): c for c in df.columns}
+
+    # clientName
+    if "clientName" not in df.columns:
+        for nk, actual in norm_to_actual.items():
+            if "clientname" in nk or "cleintname" in nk:
+                df = df.rename(columns={actual: "clientName"})
+                break
+
+    # groupid
+    if "groupid" not in df.columns:
+        for nk, actual in norm_to_actual.items():
+            if nk.startswith("group"):
+                df = df.rename(columns={actual: "groupid"})
+                break
+
+    return df
+
+def _is_s3_uri(s: str) -> bool:
+    return isinstance(s, str) and s.lower().startswith("s3://")
+
+def _resolve_s3_excel_object(s3_client, s3_uri: str) -> Tuple[str, str]:
+    """
+    Accept either an exact XLSX URI or an S3 prefix. If a prefix is provided,
+    select the most recently modified .xlsx under that prefix.
+    """
+    b, k = _parse_s3_uri(s3_uri)
+    if k.lower().endswith(".xlsx"):
+        return b, k
+
+    prefix = k.strip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+
+    paginator = s3_client.get_paginator("list_objects_v2")
+    candidates: List[dict] = []
+    for page in paginator.paginate(Bucket=b, Prefix=prefix):
+        for obj in (page.get("Contents") or []):
+            key = obj.get("Key") or ""
+            if key.lower().endswith(".xlsx"):
+                candidates.append(obj)
+
+    if not candidates:
+        raise FileNotFoundError(f"No .xlsx found under s3://{b}/{prefix}")
+
+    candidates.sort(key=lambda o: o.get("LastModified"), reverse=True)
+    return b, candidates[0]["Key"]
+
+# =========================
+# XLSX mapping parsing
+# =========================
+
+def _split_clientname_pattern(s: str) -> Tuple[str, str]:
+    s = (s or "").strip()
+    if "|" in s:
+        base, scope = s.split("|", 1)
+        return base.strip(), scope.strip()
+    return s, ""
+
+def _scope_kind_and_value(scope_input: str) -> Tuple[str, Optional[str]]:
+    si = (scope_input or "").strip()
+    if not si:
+        return "none", None
+    n = normalize_country(si)
+    if n and len(n) in (2, 3):
+        return "country", n
+    return "text", si
+
+def scope_folder_name(scope_input: str, kind: str, val: Optional[str]) -> str:
+    if kind == "country" and val:
+        if val == "US":
+            return "US"
+        return f"Country/{val}"
+    if kind == "text" and val:
+        if val.lower().startswith("ultimate"):
+            return "Ultimate Parent"
+        if val.lower().startswith("corporate"):
+            return "Corporate Family"
+        return val
+    return "US"
+
+@dataclass
+class MappingRow:
+    client_display: str
+    client_canon: str
+    client_compact: str
+    client_acronym: str
+    scope_kind: str
+    scope_value: Optional[str]
+    group_id: str
+    scope_dir: str
+
+class ClientGroupMapper:
+    def __init__(self, xlsx_path: str, client_col: str = "clientName", group_col: str = "groupid"):
+        self.xlsx_path = xlsx_path
+        self.client_col = client_col
+        self.group_col = group_col
+        self.rows: List[MappingRow] = []
+        self._by_key: Dict[Tuple[str, str, Optional[str]], MappingRow] = {}
+        self._display_by_canon: Dict[str, str] = {}
+        self._clients_canon: List[str] = []
+        self._clients_compact: Dict[str, str] = {}
+        self._acr_to_canons: Dict[str, List[str]] = {}
+
+    def load(self, s3_client) -> None:
+        data: bytes
+        if _is_s3_uri(str(self.xlsx_path)):
+            b, k = _resolve_s3_excel_object(s3_client, self.xlsx_path)
+            obj = s3_client.get_object(Bucket=b, Key=k)
+            data = obj["Body"].read()
+        else:
+            data = open(self.xlsx_path, "rb").read()
+
+        df = pd.read_excel(io.BytesIO(data))
+        df = _canonicalize_xlsx_headers(df)
+        self.rows = []
+        self._by_key = {}
+        self._display_by_canon = {}
+        self._clients_canon = []
+        self._clients_compact = {}
+        self._acr_to_canons = {}
+
+        for _, r in df.iterrows():
+            raw_client = str(r.get(self.client_col) or "").strip()
+            raw_gid = str(r.get(self.group_col) or "").strip()
+            if not raw_client or not raw_gid:
+                continue
+
+            base, scope = _split_clientname_pattern(raw_client)
+            kind, val = _scope_kind_and_value(scope)
+
+            canon = canonicalize_name(base)
+            comp = canonicalize_compact(base)
+            acr = acronym(base)
+            sdir = scope_folder_name(scope, kind, val)
+
+            row = MappingRow(
+                client_display=base.strip(),
+                client_canon=canon,
+                client_compact=comp,
+                client_acronym=acr,
+                scope_kind=kind,
+                scope_value=val,
+                group_id=raw_gid.strip(),
+                scope_dir=sdir,
+            )
+
+            self.rows.append(row)
+            self._by_key[(canon, kind, val)] = row
+            self._display_by_canon.setdefault(canon, base.strip())
+            self._clients_canon.append(canon)
+            self._clients_compact.setdefault(comp, canon)
+            if acr:
+                self._acr_to_canons.setdefault(acr, [])
+                if canon not in self._acr_to_canons[acr]:
+                    self._acr_to_canons[acr].append(canon)
+
+        self._clients_canon = sorted(set(self._clients_canon))
+
+    def _resolve_client_canon(self, client_input: str) -> Optional[str]:
+        ci = (client_input or "").strip()
+        if not ci:
+            return None
+        c = canonicalize_name(ci)
+        cc = canonicalize_compact(ci)
+        acrv = ci.strip().upper()
+
+        if c in self._display_by_canon:
+            return c
+        if cc in self._clients_compact:
+            return self._clients_compact[cc]
+        hits = self._acr_to_canons.get(acrv) or []
+        if len(hits) == 1:
+            return hits[0]
+
+        subs = [canon for canon in self._clients_canon if canon and (canon in c or c in canon)]
+        if subs:
+            subs.sort(key=len, reverse=True)
+            return subs[0]
+
+        try:
+            from rapidfuzz import process, fuzz  # type: ignore
+            best = process.extractOne(c, self._clients_canon, scorer=fuzz.token_set_ratio)
+            if best:
+                best_key, score, _ = best
+                if float(score) >= 80:
+                    return best_key
+        except Exception:
+            pass
+
+        return None
+
+    def resolve_group_row(self, client_input: str, scope_input: str, allow_fuzzy: bool = True):
+        canon = self._resolve_client_canon(client_input)
+        if not canon:
+            return None, None, "client_not_found"
+        kind, val = _scope_kind_and_value(scope_input or "")
+        row = self._by_key.get((canon, kind, val))
+        if not row:
+            disp = self._display_by_canon.get(canon) or client_input
+            return None, disp, "scope_not_found"
+        disp = self._display_by_canon.get(canon) or client_input
+        return row, disp, "ok"
+
+# =========================
+# Manifest parsing structs
+# =========================
+
+@dataclass
+class ManifestDoc:
+    policy_id: str
+    source_file: Optional[str]
+    metadata: Dict[str, Any]
+
+# =========================
+# Service
+# =========================
+
+class MetadataService:
+    def __init__(
+        self,
+        client_group_xlsx_path: str,
+        faiss_index_dir: str,
+        xlsx_client_col: str = "clientName",
+        xlsx_group_col: str = "groupid",
+        bedrock_region: Optional[str] = None,
+        manifest_file_name: Optional[str] = None,
+    ):
+        self.client_group_xlsx_path = client_group_xlsx_path
+        self.faiss_index_dir = faiss_index_dir
+        self.bedrock_region = (bedrock_region or os.getenv("AWS_REGION", "us-east-1")).strip()
+        self.manifest_file_name = (manifest_file_name or os.getenv("MANIFEST_FILE_NAME") or "manifest.json").strip()
+
+        self._s3_session = _make_session(
+            region=self.bedrock_region,
+            profile_env="AWS_PROFILE_S3",
+            role_arn_env="AWS_ROLE_ARN_S3",
+            session_name="metadata-s3",
+        )
+        self._s3 = self._s3_session.client("s3", region_name=self.bedrock_region)
+
+        self.mapper = ClientGroupMapper(
+            xlsx_path=self.client_group_xlsx_path,
+            client_col=xlsx_client_col,
+            group_col=xlsx_group_col,
+        )
+        self._loaded = False
+
+    def ensure_loaded(self) -> None:
+        if not self._loaded:
+            self.mapper.load(self._s3)
+            self._loaded = True
+
+    def _get_bytes(self, bucket: str, key: str) -> bytes:
+        obj = self._s3.get_object(Bucket=bucket, Key=key)
+        return obj["Body"].read()
+
+    def _read_manifest_docs_from_s3(self, bucket: str, manifest_key: str) -> List[ManifestDoc]:
+        try:
+            raw = self._get_bytes(bucket, manifest_key)
+            text = raw.decode("utf-8-sig", errors="replace")
+            data = json.loads(text)
+        except Exception:
+            return []
+
+        docs_out: List[ManifestDoc] = []
+        for d in data.get("docs", []) or []:
+            policy_id = str(d.get("policy_id") or "").strip()
+            source_file = d.get("source_file")
+
+            md = d.get("metadata") or {}
+
+            # normalize spelling variants and nesting
+            if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                md = md["metadataAttributes"]
+            if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                md = md["metadataAtrributes"]
+
+            if isinstance(md, dict):
+                docs_out.append(ManifestDoc(policy_id=policy_id, source_file=source_file, metadata=md))
+
+        return docs_out
+
+    def _manifest_paths(self, category: str, group_id: str, scope_dir: str) -> Tuple[str, str, str]:
+        b, base_prefix = _parse_s3_uri(self.faiss_index_dir)
+        base_prefix = base_prefix.rstrip("/")
+        folder_key = _join_key(base_prefix, category, group_id, scope_dir)
+        manifest_key = _join_key(folder_key, self.manifest_file_name)
+        return b, manifest_key, folder_key
+
+    def lookup_structured(
+        self,
+        client: str,
+        country: Optional[str] = None,
+        category: Optional[str] = "cola",     # CHANGE default
+        include_manifest: bool = True,
+        max_docs_per_manifest: int = 200,
+    ) -> Dict[str, Any]:
+        self.ensure_loaded()
+
+        client_in = (client or "").strip()
+        if not client_in:
+            return {"error": "client is required"}
+
+        # CHANGE: finance -> cola (still allow callers sending COLA)
+        cat = (category or "cola").strip().lower()
+        if cat not in {"cola", "legal"}:
+            cat = "cola"
+
+        scope_input = (country or "").strip()
+
+        row, client_resolved, why = self.mapper.resolve_group_row(client_in, scope_input, allow_fuzzy=True)
+        if not row:
+            return {
+                "client_input": client_in,
+                "client_resolved": client_resolved,
+                "category": cat,
+                "scope_input": scope_input,
+                "group_id": None,
+                "capid": None,
+                "scope_kind": None,
+                "scope_value": None,
+                "scope_dir": None,
+                "manifest": {"manifests_found": 0, "manifests": [], "metadata_keys": [], "docs_truncated": False},
+                "error": f"Could not resolve group_id from XLSX ({why}).",
+            }
+
+        capid = row.group_id if row.scope_kind == "country" and row.scope_value else None
+        scope_dir = row.scope_dir
+
+        manifest_payload: Dict[str, Any] = {
+            "manifests_found": 0,
+            "manifests": [],
+            "metadata_keys": [],
+            "docs_truncated": False,
+        }
+
+        if include_manifest:
+            bucket, manifest_key, folder_key = self._manifest_paths(cat, row.group_id, scope_dir)
+            docs = self._read_manifest_docs_from_s3(bucket, manifest_key)
+
+            truncated = False
+            if len(docs) > max_docs_per_manifest:
+                docs = docs[:max_docs_per_manifest]
+                truncated = True
+                manifest_payload["docs_truncated"] = True
+
+            all_keys = set()
+            docs_out = []
+            for d in docs:
+                for k in (d.metadata or {}).keys():
+                    all_keys.add(str(k))
+
+                # KEEP existing "metadata" field + ADD explicit "metadataAttributes"
+                docs_out.append(
+                    {
+                        "policy_id": d.policy_id,
+                        "source_file": d.source_file,
+                        "metadata": d.metadata,
+                        "metadataAttributes": d.metadata,
+                    }
+                )
+
+            manifest_payload["manifests"].append(
+                {
+                    "folder": _s3_uri(bucket, folder_key),
+                    "manifest_path": _s3_uri(bucket, manifest_key),
+                    "exists": bool(docs_out),
+                    "docs_count_returned": len(docs_out),
+                    "docs_truncated": truncated,
+                    "docs": docs_out,
+                }
+            )
+            manifest_payload["manifests_found"] = 1
+            manifest_payload["metadata_keys"] = sorted(all_keys)
+
+        return {
+            "client_input": client_in,
+            "client_resolved": client_resolved,
+            "category": cat,
+            "scope_input": scope_input,
+            "scope_kind": row.scope_kind,
+            "scope_value": row.scope_value,
+            "scope_dir": scope_dir,
+            "group_id": row.group_id,
+            "capid": capid,
+            "manifest": manifest_payload,
+            "error": None,
+        }
+
+
+    ###
+
+
+    # services/rag_search_service.py
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import boto3
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import FAISS
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    p = urlparse(uri)
+    if p.scheme != "s3":
+        raise ValueError(f"Not an s3 URI: {uri}")
+    return p.netloc, (p.path or "").lstrip("/")
+
+def _join_key(*parts: str) -> str:
+    return "/".join([p.strip("/").strip() for p in parts if str(p or "").strip()])
+
+def _make_session(region: str, profile_env: str, role_arn_env: str, session_name: str):
+    profile = (os.getenv(profile_env) or "").strip()
+    role_arn = (os.getenv(role_arn_env) or "").strip()
+
+    if profile:
+        base = boto3.Session(profile_name=profile, region_name=region)
+    else:
+        base = boto3.Session(region_name=region)
+
+    if role_arn:
+        sts = base.client("sts", region_name=region)
+        creds = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)["Credentials"]
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+            region_name=region,
+        )
+    return base
+
+def _scope_dir_from_scope_input(s: str) -> str:
+    # preserve existing mapping
+    t = (s or "").strip().lower()
+    if t in {"us", "usa", "united states"}:
+        return "US"
+    if t.startswith("ultimate"):
+        return "Ultimate Parent"
+    if t.startswith("corporate"):
+        return "Corporate Family"
+    return s.strip()
+
+@dataclass
+class RagChunk:
+    rank: int
+    score: float
+    text: str
+    metadata: Dict[str, Any]
+
+class RagSearchService:
+    def __init__(
+        self,
+        faiss_index_dir: str,
+        bedrock_region: Optional[str] = None,
+        embedding_model_id: Optional[str] = None,
+        default_top_k: int = 8,
+        default_category: str = "cola",   # CHANGE default
+        faiss_cache_dir: Optional[str] = None,
+        mmr_fetch_k: Optional[int] = None,
+        mmr_lambda_mult: float = 0.5,
+    ):
+        faiss_index_dir = str(faiss_index_dir or "").strip()
+        if not faiss_index_dir.lower().startswith("s3://"):
+            raise ValueError(f"FAISS_INDEX_DIR must be s3://bucket/path, got: {faiss_index_dir!r}")
+
+        self.bedrock_region = (bedrock_region or os.getenv("AWS_REGION", "us-east-1")).strip()
+        self.bucket, self.base_prefix = _parse_s3_uri(faiss_index_dir.rstrip("/"))
+        self.base_prefix = self.base_prefix.rstrip("/")
+
+        self.embedding_model_id = embedding_model_id or os.getenv(
+            "BEDROCK_EMBEDDING_MODEL",
+            "amazon.titan-embed-text-v1",
+        )
+
+        self.default_top_k = int(default_top_k)
+
+        # CHANGE: finance -> cola
+        self.default_category = (default_category or "cola").strip().lower()
+        if self.default_category not in {"cola", "legal"}:
+            self.default_category = "cola"
+
+        self.mmr_fetch_k = int(mmr_fetch_k) if mmr_fetch_k is not None else max(self.default_top_k * 5, 25)
+        self.mmr_lambda_mult = float(mmr_lambda_mult)
+
+        self.faiss_cache_dir = (faiss_cache_dir or os.getenv("FAISS_INDEX_DIR_LOCAL") or "/tmp/faiss_indices").strip()
+        if not self.faiss_cache_dir:
+            self.faiss_cache_dir = "/tmp/faiss_indices"
+
+        # S3 session
+        self._s3_session = _make_session(
+            region=self.bedrock_region,
+            profile_env="AWS_PROFILE_S3",
+            role_arn_env="AWS_ROLE_ARN_S3",
+            session_name="rag-s3",
+        )
+        self._s3 = self._s3_session.client("s3", region_name=self.bedrock_region)
+
+        # Bedrock session
+        self._br_session = _make_session(
+            region=self.bedrock_region,
+            profile_env="AWS_PROFILE_BEDROCK",
+            role_arn_env="AWS_ROLE_ARN_BEDROCK",
+            session_name="rag-bedrock",
+        )
+        self._bedrock_runtime = self._br_session.client("bedrock-runtime", region_name=self.bedrock_region)
+
+        self._embeddings = None
+
+    def _list_keys(self, prefix: str) -> List[str]:
+        prefix = prefix.rstrip("/") + "/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        out: List[str] = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                k = obj.get("Key") or ""
+                if k and not k.endswith("/"):
+                    out.append(k)
+        return out
+
+    def _download(self, key: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        self._s3.download_file(self.bucket, key, str(dest))
+
+    def _try_download_manifest(self, folder_prefix: str, local_folder: Path) -> Optional[Dict[str, Any]]:
+        folder_prefix = folder_prefix.rstrip("/") + "/"
+        manifest_key = folder_prefix + "manifest.json"
+        try:
+            self._download(manifest_key, local_folder / "manifest.json")
+            data = (local_folder / "manifest.json").read_text(encoding="utf-8", errors="replace")
+            return json.loads(data)
+        except Exception:
+            return None
+
+    def _load_manifest_doc_meta_map(self, folder_prefix: str, local_folder: Path) -> Dict[str, Dict[str, Any]]:
+        """
+        NEW: best-effort fetch manifest.json and build map policy_id -> metadataAttributes dict
+        """
+        payload = self._try_download_manifest(folder_prefix, local_folder)
+        if not isinstance(payload, dict):
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for d in (payload.get("docs") or []):
+            if not isinstance(d, dict):
+                continue
+            pid = str(d.get("policy_id") or "").strip()
+            md = d.get("metadata") or {}
+
+            # normalize spelling variants / nesting
+            if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                md = md["metadataAttributes"]
+            if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                md = md["metadataAtrributes"]
+
+            if pid and isinstance(md, dict):
+                out[pid] = md
+        return out
+
+    def _emb(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        self._embeddings = BedrockEmbeddings(model_id=self.embedding_model_id, client=self._bedrock_runtime)
+        return self._embeddings
+
+    def _pick_faiss_files_in_folder(self, folder_prefix: str) -> tuple[str, str]:
+        folder_prefix = folder_prefix.rstrip("/") + "/"
+        keys = self._list_keys(folder_prefix)
+
+        faiss_candidates = [k for k in keys if k.lower().endswith(".faiss")]
+        pkl_candidates = [k for k in keys if k.lower().endswith(".pkl")]
+
+        if not faiss_candidates or not pkl_candidates:
+            raise FileNotFoundError(f"Could not find both .faiss and .pkl under s3://{self.bucket}/{folder_prefix}")
+
+        return faiss_candidates[0], pkl_candidates[0]
+
+    def _load_faiss_store(self, folder: Path):
+        try:
+            return FAISS.load_local(str(folder), self._emb(), allow_dangerous_deserialization=True)
+        except TypeError:
+            return FAISS.load_local(str(folder), self._emb())
+
+    def _json_sanitize(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): self._json_sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_sanitize(v) for v in obj]
+        return str(obj)
+
+    def retrieve_chunks_structured(
+        self,
+        query: str,
+        *,
+        capid: Optional[str] = None,
+        group_id: Optional[str] = None,
+        scope: str,
+        category: Optional[str] = "cola",   # CHANGE default
+        top_k: Optional[int] = None,
+        include_manifest: bool = False,
+    ) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("query is required")
+
+        cap = (capid or "").strip()
+        gid = (group_id or "").strip()
+        if bool(cap) == bool(gid):
+            raise ValueError("Provide exactly one of capid OR group_id")
+
+        scp = (scope or "").strip()
+        if not scp:
+            raise ValueError("scope is required (US / Ultimate Parent / Corporate Family)")
+
+        # CHANGE: finance -> cola
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"cola", "legal"}:
+            cat = self.default_category
+
+        k = int(top_k) if top_k else self.default_top_k
+
+        id_used = cap or gid
+        id_type = "capid" if cap else "group_id"
+        scope_dir = _scope_dir_from_scope_input(scp)
+
+        folder_prefix = _join_key(self.base_prefix, cat, id_used, scope_dir)
+        faiss_key, pkl_key = self._pick_faiss_files_in_folder(folder_prefix)
+
+        local_folder = Path(self.faiss_cache_dir) / self.base_prefix / cat / id_used / scope_dir
+        self._download(faiss_key, local_folder / Path(faiss_key).name)
+        self._download(pkl_key, local_folder / Path(pkl_key).name)
+
+        store = self._load_faiss_store(local_folder)
+
+        mmr_docs = store.max_marginal_relevance_search(q, k=k, fetch_k=self.mmr_fetch_k, lambda_mult=self.mmr_lambda_mult)
+        scored = store.similarity_search_with_score(q, k=self.mmr_fetch_k)
+
+        def _doc_key(d) -> str:
+            md = getattr(d, "metadata", {}) or {}
+            md_items = sorted((str(k2), str(v2)) for k2, v2 in md.items())
+            return (getattr(d, "page_content", "") or "") + "||" + "||".join([f"{k2}={v2}" for k2, v2 in md_items])
+
+        score_map: Dict[str, float] = {}
+        for d, s in scored:
+            key2 = _doc_key(d)
+            if key2 not in score_map or float(s) < score_map[key2]:
+                score_map[key2] = float(s)
+
+        # NEW: build doc-metadata map from manifest (best-effort)
+        doc_meta_map = self._load_manifest_doc_meta_map(folder_prefix, local_folder)
+
+        merged: List[RagChunk] = []
+        for d in mmr_docs:
+            text = (d.page_content or "").strip()
+            md = dict(d.metadata or {})
+            md.setdefault("_index_folder", str(local_folder))
+
+            # NEW: merge manifest doc metadata chunk-wise
+            pid = str(md.get("policy_id") or "").strip()
+            if pid and pid in doc_meta_map:
+                existing = md.get("metadataAttributes")
+                base = dict(doc_meta_map[pid] or {})
+                if isinstance(existing, dict):
+                    base.update(existing)  # preserve chunk overrides
+                md["metadataAttributes"] = base
+
+            sc = score_map.get(_doc_key(d), 0.0)
+            merged.append(RagChunk(rank=0, score=float(sc), text=text, metadata=md))
+
+        merged.sort(key=lambda x: x.score)
+
+        manifest_payload: Optional[Dict[str, Any]] = None
+        if include_manifest:
+            # KEEP: return raw manifest when requested
+            manifest_payload = self._try_download_manifest(folder_prefix, local_folder)
+
+        return {
+            "top_chunks": [{"text": ch.text, "metadata": self._json_sanitize(ch.metadata)} for ch in merged[:k]],
+            "id_used": id_used,
+            "id_type": id_type,
+            "scope_dir": scope_dir,
+            "category": cat,
+            "manifest": manifest_payload,
+        }
+
+    ###
+
+    # app.py
+import os
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from services.metadata_service import MetadataService
+from services.rag_search_service import RagSearchService
+
+load_dotenv()
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1").strip()
+FAISS_INDEX_DIR = (os.getenv("FAISS_INDEX_DIR") or "").strip()
+CLIENT_GROUP_XLSX_PATH = (os.getenv("CLIENT_GROUP_XLSX_PATH") or "").strip()
+
+XLSX_CLIENT_COL = (os.getenv("XLSX_CLIENT_COL") or "clientName").strip()
+XLSX_GROUP_COL = (os.getenv("XLSX_GROUP_COL") or "groupid").strip()
+
+if not FAISS_INDEX_DIR.lower().startswith("s3://"):
+    raise RuntimeError(f"FAISS_INDEX_DIR must be s3://bucket/prefix, got: {FAISS_INDEX_DIR!r}")
+if not CLIENT_GROUP_XLSX_PATH:
+    raise RuntimeError("CLIENT_GROUP_XLSX_PATH is required (s3://... or local path)")
+
+svc = MetadataService(
+    client_group_xlsx_path=CLIENT_GROUP_XLSX_PATH,
+    faiss_index_dir=FAISS_INDEX_DIR,
+    xlsx_client_col=XLSX_CLIENT_COL,
+    xlsx_group_col=XLSX_GROUP_COL,
+    bedrock_region=AWS_REGION,
+)
+
+rag = RagSearchService(
+    faiss_index_dir=FAISS_INDEX_DIR,
+    bedrock_region=AWS_REGION,
+    embedding_model_id=os.getenv("BEDROCK_EMBEDDING_MODEL"),
+    default_top_k=int(os.getenv("RAG_TOP_K", "8")),
+    default_category=os.getenv("RAG_DEFAULT_CATEGORY", "cola"),  # CHANGE default
+    faiss_cache_dir=os.getenv("FAISS_INDEX_DIR_LOCAL", "/tmp/faiss_indices"),
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        svc.ensure_loaded()
+        print("[INFO] XLSX mapping loaded")
+    except Exception as e:
+        print(f"[WARN] startup preload failed: {e}")
+    yield
+
+app = FastAPI(
+    title="Structured Metadata + RAG Retrieval API",
+    version="6.0.0",
+    lifespan=lifespan,
+)
+
+class MetadataLookupRequest(BaseModel):
+    client: str
+    country: Optional[str] = None
+    category: str = "cola"          # CHANGE default
+    include_manifest: bool = True
+    max_docs_per_manifest: int = 200
+
+class RagSearchRequest(BaseModel):
+    query: str
+    capid: Optional[str] = None
+    group_id: Optional[str] = None
+    country: str  # scope
+    category: str = "cola"          # CHANGE default
+    top_k: Optional[int] = None
+    include_manifest: bool = False
+
+@app.post("/api/metadata/lookup", response_model=Dict[str, Any], tags=["metadata"])
+def metadata_lookup(payload: MetadataLookupRequest):
+    client = (payload.client or "").strip()
+    if not client:
+        raise HTTPException(status_code=400, detail="client is required")
+    try:
+        res = svc.lookup_structured(
+            client=client,
+            country=payload.country,
+            category=payload.category,
+            include_manifest=payload.include_manifest,
+            max_docs_per_manifest=payload.max_docs_per_manifest,
+        )
+        if res.get("error"):
+            raise HTTPException(status_code=404, detail=res["error"])
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"metadata lookup failed: {e}")
+
+@app.post("/api/rag/search", response_model=Dict[str, Any], tags=["rag"])
+def rag_search(payload: RagSearchRequest):
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    scope = (payload.country or "").strip()
+    if not scope:
+        raise HTTPException(status_code=400, detail="country(scope) is required: US / Ultimate Parent / Corporate Family")
+
+    cap = (payload.capid or "").strip()
+    gid = (payload.group_id or "").strip()
+    if bool(cap) == bool(gid):
+        raise HTTPException(status_code=400, detail="Provide exactly one of capid OR group_id")
+
+    try:
+        return rag.retrieve_chunks_structured(
+            query=query,
+            capid=cap or None,
+            group_id=gid or None,
+            scope=scope,
+            category=payload.category,
+            top_k=payload.top_k,
+            include_manifest=payload.include_manifest,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rag search failed: {e}")
+
+
+
+####
