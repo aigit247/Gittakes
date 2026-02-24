@@ -1,0 +1,1123 @@
+###########
+
+
+# services/metadata_service.py
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, unquote  # <-- MINOR: add unquote
+
+import boto3
+import pandas as pd
+from botocore.exceptions import ClientError
+
+
+# =========================
+# Text helpers
+# =========================
+
+_LEGAL_SUFFIX_TOKENS = {"inc", "ltd", "llc", "plc", "as", "sa", "ag", "gmbh", "bv", "nv", "s"}
+
+
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def canonicalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return _clean_spaces(s)
+
+
+def canonicalize_compact(s: str) -> str:
+    return canonicalize_name(s).replace(" ", "")
+
+
+def acronym(name: str) -> str:
+    toks = canonicalize_name(name).split()
+    while toks and toks[-1] in _LEGAL_SUFFIX_TOKENS:
+        toks.pop()
+    return "".join(t[0] for t in toks).upper() if toks else ""
+
+
+def normalize_country(country: Optional[str]) -> Optional[str]:
+    if not country:
+        return None
+    c = str(country).strip().upper()
+
+    if c in {"UNITED STATES", "U.S.", "U.S", "US", "USA"}:
+        return "US"
+    if c in {"UNITED KINGDOM", "GREAT BRITAIN", "GB", "UK"}:
+        return "UK"
+    if c in {"INDIA", "IN", "IND"}:
+        return "IN"
+    return c or None
+
+
+def scope_folder_name(scope_input: str, scope_kind: str, scope_value: Optional[str]) -> str:
+    """
+    Folder name under group_id:
+      - country -> 'US'/'IN'/...
+      - ultimate_parent -> 'Ultimate Parent'
+      - corporate_family -> 'Corporate Family'
+    """
+    sk = (scope_kind or "").strip().lower()
+    if sk == "ultimate_parent":
+        return "Ultimate Parent"
+    if sk == "corporate_family":
+        return "Corporate Family"
+    # treat as country
+    return (scope_value or normalize_country(scope_input) or (scope_input or "")).strip().upper() or "COUNTRY"
+
+
+# =========================
+# S3 helpers
+# =========================
+
+def _is_s3_uri(s: str) -> bool:
+    return isinstance(s, str) and s.lower().startswith("s3://")
+
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    # MINOR: decode %xx and strip leading '/' so boto3 Key is valid
+    u = urlparse((uri or "").strip())
+    bucket = (u.netloc or "").strip()
+    key = unquote((u.path or "")).lstrip("/")  # <-- MINOR change
+    if not bucket:
+        raise ValueError(f"Invalid S3 URI (missing bucket): {uri}")
+    return bucket, key
+
+
+def _join_key(*parts: str) -> str:
+    out = []
+    for p in parts:
+        p = str(p or "").strip("/")
+        if p:
+            out.append(p)
+    return "/".join(out)
+
+
+def _s3_uri(bucket: str, key: str) -> str:
+    return f"s3://{bucket}/{key.lstrip('/')}"
+
+
+def _list_keys(s3_client, bucket: str, prefix: str) -> List[str]:
+    prefix = (prefix or "").lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+    paginator = s3_client.get_paginator("list_objects_v2")
+    out: List[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            k = obj.get("Key") or ""
+            if k and not k.endswith("/"):
+                out.append(k)
+    return out
+
+
+def _resolve_s3_excel_object(s3_client, xlsx_s3_uri: str) -> Tuple[str, str]:
+    """
+    Accepts:
+      - s3://bucket/key.xlsx
+      - s3://bucket/prefix/   (finds first .xlsx/.xls under prefix)
+    """
+    bucket, key = _parse_s3_uri(xlsx_s3_uri)
+    lk = (key or "").lower()
+
+    if lk.endswith(".xlsx") or lk.endswith(".xls"):
+        return bucket, key
+
+    keys = _list_keys(s3_client, bucket, key)
+    excels = [k for k in keys if k.lower().endswith(".xlsx") or k.lower().endswith(".xls")]
+    if not excels:
+        raise FileNotFoundError(f"No .xlsx/.xls found under s3://{bucket}/{key.rstrip('/')}/")
+
+    # deterministic pick
+    excels.sort()
+    return bucket, excels[0]
+
+
+# =========================
+# Sessions (S3 only here)
+# =========================
+
+S3_AWS_ACCESS_KEY_ID = ""
+S3_AWS_SECRET_ACCESS_KEY = ""
+S3_AWS_SESSION_TOKEN = ""
+
+
+def _pick_static_creds_for(profile_env: str) -> Tuple[str, str, str]:
+    if profile_env == "AWS_PROFILE_S3":
+        ak = os.getenv("AWS_ACCESS_KEY_ID_S3") or S3_AWS_ACCESS_KEY_ID
+        sk = os.getenv("AWS_SECRET_ACCESS_KEY_S3") or S3_AWS_SECRET_ACCESS_KEY
+        st = os.getenv("AWS_SESSION_TOKEN_S3") or S3_AWS_SESSION_TOKEN
+        return ak.strip(), sk.strip(), st.strip()
+    return "", "", ""
+
+
+def _make_session(region: str, profile_env: str, role_arn_env: str, session_name: str) -> boto3.Session:
+    ak, sk, st = _pick_static_creds_for(profile_env)
+    if ak and sk:
+        return boto3.Session(
+            aws_access_key_id=ak,
+            aws_secret_access_key=sk,
+            aws_session_token=(st or None),
+            region_name=region,
+        )
+
+    profile = (os.getenv(profile_env) or "").strip()
+    base = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+
+    role_arn = (os.getenv(role_arn_env) or "").strip()
+    if not role_arn:
+        return base
+
+    sts = base.client("sts", region_name=region)
+    resp = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
+    c = resp["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=c["AccessKeyId"],
+        aws_secret_access_key=c["SecretAccessKey"],
+        aws_session_token=c["SessionToken"],
+        region_name=region,
+    )
+
+
+# =========================
+# XLSX parsing
+# =========================
+
+_SCOPE_UP = canonicalize_name("Ultimate Parent")
+_SCOPE_CF = canonicalize_name("Corporate Family")
+
+
+def _split_clientname_pattern(s: str) -> Tuple[str, str]:
+    s = _clean_spaces(s)
+    for sep in [" - ", " – ", " — "]:
+        if sep in s:
+            base, suf = s.rsplit(sep, 1)
+            return base.strip(), suf.strip()
+    return s.strip(), ""
+
+
+def _scope_kind_and_value(scope_raw: str) -> Tuple[str, Optional[str]]:
+    sr = _clean_spaces(scope_raw)
+    sc = canonicalize_name(sr)
+    if sc == _SCOPE_UP:
+        return "ultimate_parent", None
+    if sc == _SCOPE_CF:
+        return "corporate_family", None
+    return "country", normalize_country(sr)
+
+
+def _norm_col(c: str) -> str:
+    # removes spaces, +, _, parentheses etc
+    return re.sub(r"[^a-z0-9]+", "", (c or "").lower())
+
+
+def _canonicalize_xlsx_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Your real headers:
+      - "Cleint NAme (as in xxx)"  (typo + spaces + parentheses)
+      - "GROUP (country+ultimate_parent)" (no groupid)
+    We detect by normalized patterns and rename to:
+      - clientName
+      - groupid
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    norm_to_actual = {_norm_col(c): c for c in df.columns}
+
+    # ---- client column detection (handles typo 'cleint') ----
+    # find first column whose normalized header contains either 'clientname' or 'cleintname'
+    client_candidates = []
+    for nk, actual in norm_to_actual.items():
+        if "clientname" in nk or "cleintname" in nk:
+            client_candidates.append(actual)
+    if client_candidates and "clientName" not in df.columns:
+        df = df.rename(columns={client_candidates[0]: "clientName"})
+
+    # ---- group column detection ----
+    if "groupid" not in df.columns:
+        group_keys = [nk for nk in norm_to_actual.keys() if nk.startswith("group")]
+        if group_keys:
+            df = df.rename(columns={norm_to_actual[group_keys[0]]: "groupid"})
+
+    return df
+
+
+@dataclass(frozen=True)
+class MappingRow:
+    client_display: str
+    client_canon: str
+    client_compact: str
+    client_acronym: str
+    scope_kind: str
+    scope_value: Optional[str]
+    group_id: str
+    scope_dir: str
+
+
+class ClientGroupMapper:
+    """
+    XLSX columns after canonicalize:
+      - clientName
+      - groupid
+    clientName rows are like:
+      "Client - US" OR "Client - Ultimate Parent" OR "Client - Corporate Family"
+    """
+
+    def __init__(self, xlsx_path: str, client_col: str = "clientName", group_col: str = "groupid"):
+        self.xlsx_path = str(xlsx_path or "").strip()
+        self.client_col = str(client_col or "").strip() or "clientName"
+        self.group_col = str(group_col or "").strip() or "groupid"
+
+        self.rows: List[MappingRow] = []
+        self._by_key: Dict[Tuple[str, str, Optional[str]], MappingRow] = {}
+        self._display_by_canon: Dict[str, str] = {}
+        self._clients_canon: List[str] = []
+        self._clients_compact: Dict[str, str] = {}
+        self._acr_to_canons: Dict[str, List[str]] = {}
+        self._rows_by_client_canon: Dict[str, List[MappingRow]] = {}
+
+    def load(self, s3_client) -> None:
+        if self.rows:
+            return
+        if not self.xlsx_path:
+            raise ValueError("CLIENT_GROUP_XLSX_PATH is required")
+
+        if _is_s3_uri(self.xlsx_path):
+            try:
+                b, k = _resolve_s3_excel_object(s3_client, self.xlsx_path)
+                obj = s3_client.get_object(Bucket=b, Key=k)
+                data = obj["Body"].read()
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code")
+                msg = e.response.get("Error", {}).get("Message")
+                raise FileNotFoundError(f"Failed to read XLSX from {self.xlsx_path}. AWS Error={code}: {msg}")
+        else:
+            p = self.xlsx_path
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"XLSX not found on disk: {p}")
+            with open(p, "rb") as f:
+                data = f.read()
+
+        df = pd.read_excel(io.BytesIO(data), dtype=str, keep_default_na=False)
+        df = _canonicalize_xlsx_headers(df)
+
+        if self.client_col not in df.columns:
+            raise ValueError(f"XLSX missing client column after rename. Columns={list(df.columns)}")
+        if self.group_col not in df.columns:
+            raise ValueError(f"XLSX missing group column after rename. Columns={list(df.columns)}")
+
+        out: List[MappingRow] = []
+        by_key: Dict[Tuple[str, str, Optional[str]], MappingRow] = {}
+        display_by_canon: Dict[str, str] = {}
+        clients_canon: List[str] = []
+        clients_compact: Dict[str, str] = {}
+        acr_to_canons: Dict[str, List[str]] = {}
+        rows_by_client: Dict[str, List[MappingRow]] = {}
+
+        for _, r in df.iterrows():
+            raw_client = str(r.get(self.client_col) or "").strip()
+            raw_gid = str(r.get(self.group_col) or "").strip()
+            if not raw_client or not raw_gid:
+                continue
+
+            base, scope = _split_clientname_pattern(raw_client)
+            kind, val = _scope_kind_and_value(scope)
+
+            canon = canonicalize_name(base)
+            comp = canonicalize_compact(base)
+            acr = acronym(base)
+            sdir = scope_folder_name(scope, kind, val)
+
+            row = MappingRow(
+                client_display=base.strip(),
+                client_canon=canon,
+                client_compact=comp,
+                client_acronym=acr,
+                scope_kind=kind,
+                scope_value=val,
+                group_id=raw_gid.strip(),
+                scope_dir=sdir,
+            )
+
+            out.append(row)
+            by_key[(canon, kind, val)] = row
+
+            if canon and canon not in display_by_canon:
+                display_by_canon[canon] = base.strip()
+                clients_canon.append(canon)
+            if comp and canon and comp not in clients_compact:
+                clients_compact[comp] = canon
+            if acr and canon:
+                acr_to_canons.setdefault(acr, [])
+                if canon not in acr_to_canons[acr]:
+                    acr_to_canons[acr].append(canon)
+
+            rows_by_client.setdefault(canon, []).append(row)
+
+        self.rows = out
+        self._by_key = by_key
+        self._display_by_canon = display_by_canon
+        self._clients_canon = sorted(set(clients_canon))
+        self._clients_compact = clients_compact
+        self._acr_to_canons = acr_to_canons
+        self._rows_by_client_canon = rows_by_client
+
+    def _resolve_client_canon(self, client_input: str, allow_fuzzy: bool = True) -> Optional[str]:
+        ci = (client_input or "").strip()
+        if not ci:
+            return None
+
+        c = canonicalize_name(ci)
+        cc = canonicalize_compact(ci)
+        acr = ci.strip().upper()
+
+        if c in self._display_by_canon:
+            return c
+        if cc in self._clients_compact:
+            return self._clients_compact[cc]
+        hits = self._acr_to_canons.get(acr) or []
+        if len(hits) == 1:
+            return hits[0]
+
+        subs = [canon for canon in self._clients_canon if canon and (canon in c or c in canon)]
+        if subs:
+            subs.sort(key=len, reverse=True)
+            return subs[0]
+
+        if allow_fuzzy:
+            try:
+                from rapidfuzz import process, fuzz  # type: ignore
+                best = process.extractOne(c, self._clients_canon, scorer=fuzz.token_set_ratio)
+                if best:
+                    best_key, score, _ = best
+                    if float(score) >= 80:
+                        return best_key
+            except Exception:
+                pass
+        return None
+
+    def resolve_group_row(
+        self,
+        client_input: str,
+        scope_input: Optional[str],
+        *,
+        allow_fuzzy: bool = True,
+    ) -> Tuple[Optional[MappingRow], Optional[str], str]:
+        client_canon = self._resolve_client_canon(client_input, allow_fuzzy=allow_fuzzy)
+        if not client_canon:
+            return None, None, "client no match"
+
+        client_disp = self._display_by_canon.get(client_canon)
+        kind, val = _scope_kind_and_value(scope_input or "")
+
+        row = self._by_key.get((client_canon, kind, val))
+        if row:
+            return row, client_disp, "exact match"
+
+        return None, client_disp, f"no mapping for scope ({kind},{val})"
+
+    def all_rows_for_client(self, client_input: str) -> List[MappingRow]:
+        client_canon = self._resolve_client_canon(client_input, allow_fuzzy=True)
+        if not client_canon:
+            return []
+        return list(self._rows_by_client_canon.get(client_canon) or [])
+
+
+@dataclass
+class ManifestDoc:
+    policy_id: str
+    source_file: Optional[str]
+    metadata: Dict[str, Any]
+
+
+class MetadataService:
+    """
+    Manifest + mapping API.
+    Index layout expected on S3:
+      s3://<bucket>/<base_prefix>/<category>/<group_id>/<scope_dir>/manifest.json
+    """
+
+    def __init__(
+        self,
+        client_group_xlsx_path: str,
+        faiss_index_dir: str,
+        xlsx_client_col: str = "clientName",
+        xlsx_group_col: str = "groupid",
+        bedrock_region: Optional[str] = None,
+        manifest_file_name: Optional[str] = None,
+        **_ignored_kwargs,
+    ):
+        self.client_group_xlsx_path = str(client_group_xlsx_path or "").strip()
+        self.faiss_index_dir = str(faiss_index_dir or "").strip().rstrip("/")
+        if not self.faiss_index_dir.lower().startswith("s3://"):
+            raise ValueError(f"FAISS_INDEX_DIR must be s3://bucket/prefix, got: {self.faiss_index_dir!r}")
+        if not self.client_group_xlsx_path:
+            raise ValueError("CLIENT_GROUP_XLSX_PATH is required")
+
+        self.bedrock_region = (bedrock_region or os.getenv("AWS_REGION", "us-east-1")).strip()
+        self.manifest_file_name = (manifest_file_name or os.getenv("MANIFEST_FILE_NAME") or "manifest.json").strip()
+
+        self._s3_session = _make_session(
+            region=self.bedrock_region,
+            profile_env="AWS_PROFILE_S3",
+            role_arn_env="AWS_ROLE_ARN_S3",
+            session_name="metadata-s3",
+        )
+        self._s3 = self._s3_session.client("s3", region_name=self.bedrock_region)
+
+        self.mapper = ClientGroupMapper(
+            xlsx_path=self.client_group_xlsx_path,
+            client_col=xlsx_client_col,
+            group_col=xlsx_group_col,
+        )
+        self._loaded = False
+
+    def ensure_loaded(self) -> None:
+        if not self._loaded:
+            self.mapper.load(self._s3)
+            self._loaded = True
+
+    def _get_bytes(self, bucket: str, key: str) -> bytes:
+        obj = self._s3.get_object(Bucket=bucket, Key=key)
+        return obj["Body"].read()
+
+    def _read_manifest_docs_from_s3(self, bucket: str, manifest_key: str) -> List[ManifestDoc]:
+        try:
+            raw = self._get_bytes(bucket, manifest_key)
+            text = raw.decode("utf-8-sig", errors="replace")
+            data = json.loads(text)
+        except Exception:
+            return []
+
+        docs_out: List[ManifestDoc] = []
+        for d in data.get("docs", []) or []:
+            policy_id = str(d.get("policy_id") or "").strip()
+            source_file = d.get("source_file")
+
+            md = d.get("metadata") or {}
+            if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                md = md["metadataAttributes"]
+            if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                md = md["metadataAtrributes"]
+
+            if isinstance(md, dict):
+                docs_out.append(ManifestDoc(policy_id=policy_id, source_file=source_file, metadata=md))
+
+        return docs_out
+
+    def _manifest_paths(self, category: str, group_id: str, scope_dir: str) -> Tuple[str, str, str]:
+        b, base_prefix = _parse_s3_uri(self.faiss_index_dir)
+        base_prefix = base_prefix.rstrip("/")
+        folder_key = _join_key(base_prefix, category, group_id, scope_dir)
+        manifest_key = _join_key(folder_key, self.manifest_file_name)
+        return b, manifest_key, folder_key
+
+    def lookup_structured(
+        self,
+        client: str,
+        country: Optional[str] = None,  # scope input
+        category: Optional[str] = "finance",
+        include_manifest: bool = True,
+        max_docs_per_manifest: int = 200,
+    ) -> Dict[str, Any]:
+        self.ensure_loaded()
+
+        client_in = (client or "").strip()
+        if not client_in:
+            return {"error": "client is required"}
+
+        cat = (category or "finance").strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = "finance"
+
+        # MINOR: if country not given, default to Ultimate Parent
+        scope_input = (country or "").strip() or "Ultimate Parent"
+
+        row, client_resolved, why = self.mapper.resolve_group_row(client_in, scope_input, allow_fuzzy=True)
+        if not row:
+            return {
+                "client_input": client_in,
+                "client_resolved": client_resolved,
+                "category": cat,
+                "scope_input": scope_input,
+                "group_id": None,
+                "capid": None,
+                "scope_kind": None,
+                "scope_value": None,
+                "scope_dir": None,
+                "manifest": {"manifests_found": 0, "manifests": [], "metadata_keys": [], "docs_truncated": False},
+                "error": f"Could not resolve group_id from XLSX ({why}).",
+            }
+
+        # rule: capid only if country scope AND scope_value exists
+        capid = row.group_id if row.scope_kind == "country" and row.scope_value else None
+        scope_dir = row.scope_dir
+
+        manifest_payload: Dict[str, Any] = {
+            "manifests_found": 0,
+            "manifests": [],
+            "metadata_keys": [],
+            "docs_truncated": False,
+        }
+
+        if include_manifest:
+            bucket, manifest_key, folder_key = self._manifest_paths(cat, row.group_id, scope_dir)
+            docs = self._read_manifest_docs_from_s3(bucket, manifest_key)
+
+            truncated = False
+            if len(docs) > max_docs_per_manifest:
+                docs = docs[:max_docs_per_manifest]
+                truncated = True
+                manifest_payload["docs_truncated"] = True
+
+            all_keys = set()
+            docs_out = []
+            for d in docs:
+                for k in (d.metadata or {}).keys():
+                    all_keys.add(str(k))
+                docs_out.append({"policy_id": d.policy_id, "source_file": d.source_file, "metadata": d.metadata})
+
+            manifest_payload["manifests"].append(
+                {
+                    "folder": _s3_uri(bucket, folder_key),
+                    "manifest_path": _s3_uri(bucket, manifest_key),
+                    "exists": bool(docs_out),
+                    "docs_count_returned": len(docs_out),
+                    "docs_truncated": truncated,
+                    "docs": docs_out,
+                }
+            )
+            manifest_payload["manifests_found"] = 1
+            manifest_payload["metadata_keys"] = sorted(all_keys)
+
+        return {
+            "client_input": client_in,
+            "client_resolved": client_resolved,
+            "category": cat,
+            "scope_input": scope_input,
+            "scope_kind": row.scope_kind,
+            "scope_value": row.scope_value,
+            "scope_dir": scope_dir,
+            "group_id": row.group_id,
+            "capid": capid,
+            "manifest": manifest_payload,
+            "error": None,
+        }
+    
+###
+
+
+# services/rag_search_service.py
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, unquote  # MINOR: add unquote
+
+import boto3
+from dotenv import load_dotenv
+from langchain_aws import BedrockEmbeddings
+
+try:
+    from langchain_community.vectorstores import FAISS  # type: ignore
+except Exception:
+    from langchain.vectorstores import FAISS  # type: ignore
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    # MINOR: decode %xx and strip leading '/' so boto3 Key is valid
+    u = urlparse((uri or "").strip())
+    bucket = (u.netloc or "").strip()
+    key = unquote((u.path or "")).lstrip("/")
+    if not bucket:
+        raise ValueError(f"Invalid S3 URI (missing bucket): {uri}")
+    return bucket, key
+
+
+def _join_key(*parts: str) -> str:
+    out = []
+    for p in parts:
+        p = str(p or "").strip("/")
+        if p:
+            out.append(p)
+    return "/".join(out)
+
+
+# TEMP TESTING ONLY (DO NOT COMMIT)
+S3_AWS_ACCESS_KEY_ID = ""
+S3_AWS_SECRET_ACCESS_KEY = ""
+S3_AWS_SESSION_TOKEN = ""
+
+BEDROCK_AWS_ACCESS_KEY_ID = ""
+BEDROCK_AWS_SECRET_ACCESS_KEY = ""
+BEDROCK_AWS_SESSION_TOKEN = ""
+
+
+def _pick_static_creds_for(profile_env: str) -> tuple[str, str, str]:
+    if profile_env == "AWS_PROFILE_S3":
+        ak = os.getenv("AWS_ACCESS_KEY_ID_S3") or S3_AWS_ACCESS_KEY_ID
+        sk = os.getenv("AWS_SECRET_ACCESS_KEY_S3") or S3_AWS_SECRET_ACCESS_KEY
+        st = os.getenv("AWS_SESSION_TOKEN_S3") or S3_AWS_SESSION_TOKEN
+        return ak.strip(), sk.strip(), st.strip()
+
+    if profile_env == "AWS_PROFILE_BEDROCK":
+        ak = os.getenv("AWS_ACCESS_KEY_ID_BEDROCK") or BEDROCK_AWS_ACCESS_KEY_ID
+        sk = os.getenv("AWS_SECRET_ACCESS_KEY_BEDROCK") or BEDROCK_AWS_SECRET_ACCESS_KEY
+        st = os.getenv("AWS_SESSION_TOKEN_BEDROCK") or BEDROCK_AWS_SESSION_TOKEN
+        return ak.strip(), sk.strip(), st.strip()
+
+    return "", "", ""
+
+
+def _make_session(region: str, profile_env: str, role_arn_env: str, session_name: str) -> boto3.Session:
+    ak, sk, st = _pick_static_creds_for(profile_env)
+    if ak and sk:
+        return boto3.Session(
+            aws_access_key_id=ak,
+            aws_secret_access_key=sk,
+            aws_session_token=(st or None),
+            region_name=region,
+        )
+
+    profile = (os.getenv(profile_env) or "").strip()
+    base = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+
+    role_arn = (os.getenv(role_arn_env) or "").strip()
+    if not role_arn:
+        return base
+
+    sts = base.client("sts", region_name=region)
+    resp = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
+    c = resp["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=c["AccessKeyId"],
+        aws_secret_access_key=c["SecretAccessKey"],
+        aws_session_token=c["SessionToken"],
+        region_name=region,
+    )
+
+
+def _scope_dir_from_scope_input(scope: str) -> str:
+    s = (scope or "").strip()
+    sc = s.lower()
+    if sc in {"ultimate parent", "ultimate_parent"}:
+        return "Ultimate Parent"
+    if sc in {"corporate family", "corporate_family"}:
+        return "Corporate Family"
+    # else treat as country folder like "US"
+    return (s.upper() or "COUNTRY")
+
+
+@dataclass
+class RagChunk:
+    rank: int
+    score: float
+    text: str
+    metadata: Dict[str, Any]
+
+
+class RagSearchService:
+    """
+    Reads FAISS from:
+      s3://<bucket>/<base_prefix>/<category>/<ID>/<scope_dir>/
+    Where ID is:
+      - capid (for country scope) OR
+      - group_id (for Ultimate Parent / Corporate Family)
+    """
+
+    def __init__(
+        self,
+        faiss_index_dir: str,  # s3://bucket/prefix
+        bedrock_region: str = "us-east-1",
+        embedding_model_id: Optional[str] = None,
+        default_top_k: int = 8,
+        default_category: str = "finance",
+        mmr_fetch_k: Optional[int] = None,
+        mmr_lambda_mult: float = 0.5,
+        faiss_cache_dir: Optional[str] = None,
+        **_ignored_kwargs,
+    ):
+        load_dotenv()
+
+        faiss_index_dir = str(faiss_index_dir or "").strip()
+        if not faiss_index_dir.lower().startswith("s3://"):
+            raise ValueError(f"FAISS_INDEX_DIR must be s3://bucket/path, got: {faiss_index_dir!r}")
+
+        self.bedrock_region = bedrock_region
+        self.bucket, self.base_prefix = _parse_s3_uri(faiss_index_dir.rstrip("/"))
+        self.base_prefix = self.base_prefix.rstrip("/")
+
+        self.embedding_model_id = embedding_model_id or os.getenv(
+            "BEDROCK_EMBEDDING_MODEL",
+            "amazon.titan-embed-text-v1",
+        )
+
+        self.default_top_k = int(default_top_k)
+        self.default_category = (default_category or "finance").strip().lower()
+        if self.default_category not in {"finance", "legal"}:
+            self.default_category = "finance"
+
+        self.mmr_fetch_k = int(mmr_fetch_k) if mmr_fetch_k is not None else max(self.default_top_k * 5, 25)
+        self.mmr_lambda_mult = float(mmr_lambda_mult)
+
+        self.faiss_cache_dir = (faiss_cache_dir or os.getenv("FAISS_INDEX_DIR_LOCAL") or "/tmp/faiss_indices").strip()
+        if not self.faiss_cache_dir:
+            self.faiss_cache_dir = "/tmp/faiss_indices"
+
+        # S3 session
+        self._s3_session = _make_session(
+            region=self.bedrock_region,
+            profile_env="AWS_PROFILE_S3",
+            role_arn_env="AWS_ROLE_ARN_S3",
+            session_name="rag-s3",
+        )
+        self._s3 = self._s3_session.client("s3", region_name=self.bedrock_region)
+
+        # Bedrock session
+        self._br_session = _make_session(
+            region=self.bedrock_region,
+            profile_env="AWS_PROFILE_BEDROCK",
+            role_arn_env="AWS_ROLE_ARN_BEDROCK",
+            session_name="rag-bedrock",
+        )
+        self._bedrock_runtime = self._br_session.client("bedrock-runtime", region_name=self.bedrock_region)
+
+        self._embeddings = None
+
+    def _list_keys(self, prefix: str) -> List[str]:
+        prefix = prefix.rstrip("/") + "/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        out: List[str] = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                k = obj.get("Key") or ""
+                if k and not k.endswith("/"):
+                    out.append(k)
+        return out
+
+    def _download(self, key: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        self._s3.download_file(self.bucket, key, str(dest))
+
+    def _try_download_manifest(self, folder_prefix: str, local_folder: Path) -> Optional[Dict[str, Any]]:
+        folder_prefix = folder_prefix.rstrip("/") + "/"
+        manifest_key = folder_prefix + "manifest.json"
+        try:
+            self._download(manifest_key, local_folder / "manifest.json")
+            data = (local_folder / "manifest.json").read_text(encoding="utf-8", errors="replace")
+            return json.loads(data)
+        except Exception:
+            return None
+
+    def _manifest_policyid_to_metadata(self, manifest: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Build map: policy_id -> metadataAttributes/metadataAtrributes (or metadata as-is).
+        This lets us attach manifest metadata to each chunk.
+        """
+        if not manifest or not isinstance(manifest, dict):
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        docs = manifest.get("docs", []) or []
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            pid = str(d.get("policy_id") or "").strip()
+            if not pid:
+                continue
+            md = d.get("metadata") or {}
+            if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                md = md["metadataAttributes"]
+            if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                md = md["metadataAtrributes"]
+            if isinstance(md, dict):
+                out[pid] = md
+        return out
+
+    def _emb(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        self._embeddings = BedrockEmbeddings(model_id=self.embedding_model_id, client=self._bedrock_runtime)
+        return self._embeddings
+
+    def _pick_faiss_files_in_folder(self, folder_prefix: str) -> tuple[str, str]:
+        folder_prefix = folder_prefix.rstrip("/") + "/"
+        keys = self._list_keys(folder_prefix)
+
+        faiss_candidates = [k for k in keys if k.lower().endswith(".faiss")]
+        pkl_candidates = [k for k in keys if k.lower().endswith(".pkl")]
+
+        if not faiss_candidates or not pkl_candidates:
+            raise FileNotFoundError(f"Could not find both .faiss and .pkl under s3://{self.bucket}/{folder_prefix}")
+
+        return faiss_candidates[0], pkl_candidates[0]
+
+    def _load_faiss_store(self, folder: Path):
+        try:
+            return FAISS.load_local(str(folder), self._emb(), allow_dangerous_deserialization=True)
+        except TypeError:
+            return FAISS.load_local(str(folder), self._emb())
+
+    def _json_sanitize(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): self._json_sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_sanitize(v) for v in obj]
+        return str(obj)
+
+    def retrieve_chunks_structured(
+        self,
+        query: str,
+        *,
+        capid: Optional[str] = None,
+        group_id: Optional[str] = None,
+        scope: str,
+        category: Optional[str] = "finance",
+        top_k: Optional[int] = None,
+        include_manifest: bool = False,
+    ) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("query is required")
+
+        cap = (capid or "").strip()
+        gid = (group_id or "").strip()
+
+        if bool(cap) == bool(gid):
+            raise ValueError("Provide exactly one of capid OR group_id")
+
+        # MINOR: if scope empty -> Ultimate Parent
+        scp = (scope or "").strip() or "Ultimate Parent"
+        if not scp:
+            raise ValueError("scope is required (US / Ultimate Parent / Corporate Family)")
+
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = self.default_category
+
+        k = int(top_k) if top_k else self.default_top_k
+
+        id_used = cap or gid
+        id_type = "capid" if cap else "group_id"
+        scope_dir = _scope_dir_from_scope_input(scp)
+
+        folder_prefix = _join_key(self.base_prefix, cat, id_used, scope_dir)
+        faiss_key, pkl_key = self._pick_faiss_files_in_folder(folder_prefix)
+
+        local_folder = Path(self.faiss_cache_dir) / self.base_prefix / cat / id_used / scope_dir
+        self._download(faiss_key, local_folder / Path(faiss_key).name)
+        self._download(pkl_key, local_folder / Path(pkl_key).name)
+
+        store = self._load_faiss_store(local_folder)
+
+        mmr_docs = store.max_marginal_relevance_search(
+            q, k=k, fetch_k=self.mmr_fetch_k, lambda_mult=self.mmr_lambda_mult
+        )
+        scored = store.similarity_search_with_score(q, k=self.mmr_fetch_k)
+
+        def _doc_key(d) -> str:
+            md = getattr(d, "metadata", {}) or {}
+            md_items = sorted((str(k2), str(v2)) for k2, v2 in md.items())
+            return (getattr(d, "page_content", "") or "") + "||" + "||".join([f"{k2}={v2}" for k2, v2 in md_items])
+
+        score_map: Dict[str, float] = {}
+        for d, s in scored:
+            key2 = _doc_key(d)
+            if key2 not in score_map or float(s) < score_map[key2]:
+                score_map[key2] = float(s)
+
+        manifest_payload: Optional[Dict[str, Any]] = None
+        policy_md: Dict[str, Dict[str, Any]] = {}
+
+        if include_manifest:
+            manifest_payload = self._try_download_manifest(folder_prefix, local_folder)
+            policy_md = self._manifest_policyid_to_metadata(manifest_payload)
+
+        merged: List[RagChunk] = []
+        for d in mmr_docs:
+            text = (d.page_content or "").strip()
+            md = dict(d.metadata or {})
+            md.setdefault("_index_folder", str(local_folder))
+            sc = score_map.get(_doc_key(d), 0.0)
+
+            # MINOR: attach manifest metadata per policy_id (if available)
+            pid = str(md.get("policy_id") or "").strip()
+            if pid and pid in policy_md:
+                md.setdefault("manifest_metadata", policy_md[pid])
+
+            merged.append(RagChunk(rank=0, score=float(sc), text=text, metadata=md))
+
+        merged.sort(key=lambda x: x.score)
+
+        return {
+            "top_chunks": [{"text": ch.text, "metadata": self._json_sanitize(ch.metadata)} for ch in merged[:k]],
+            "id_used": id_used,
+            "id_type": id_type,
+            "scope_dir": scope_dir,
+            "category": cat,
+            "manifest": manifest_payload,
+        }
+    
+
+###
+
+import os
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from services.metadata_service import MetadataService
+from services.rag_search_service import RagSearchService
+
+load_dotenv()
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1").strip()
+FAISS_INDEX_DIR = (os.getenv("FAISS_INDEX_DIR") or "").strip()
+CLIENT_GROUP_XLSX_PATH = (os.getenv("CLIENT_GROUP_XLSX_PATH") or "").strip()
+
+XLSX_CLIENT_COL = (os.getenv("XLSX_CLIENT_COL") or "clientName").strip()
+XLSX_GROUP_COL = (os.getenv("XLSX_GROUP_COL") or "groupid").strip()
+
+if not FAISS_INDEX_DIR.lower().startswith("s3://"):
+    raise RuntimeError(f"FAISS_INDEX_DIR must be s3://bucket/prefix, got: {FAISS_INDEX_DIR!r}")
+if not CLIENT_GROUP_XLSX_PATH:
+    raise RuntimeError("CLIENT_GROUP_XLSX_PATH is required (s3://... or local path)")
+
+svc = MetadataService(
+    client_group_xlsx_path=CLIENT_GROUP_XLSX_PATH,
+    faiss_index_dir=FAISS_INDEX_DIR,
+    xlsx_client_col=XLSX_CLIENT_COL,
+    xlsx_group_col=XLSX_GROUP_COL,
+    bedrock_region=AWS_REGION,
+)
+
+rag = RagSearchService(
+    faiss_index_dir=FAISS_INDEX_DIR,
+    bedrock_region=AWS_REGION,
+    embedding_model_id=os.getenv("BEDROCK_EMBEDDING_MODEL"),
+    default_top_k=int(os.getenv("RAG_TOP_K", "8")),
+    default_category=os.getenv("RAG_DEFAULT_CATEGORY", "finance"),
+    faiss_cache_dir=os.getenv("FAISS_INDEX_DIR_LOCAL", "/tmp/faiss_indices"),
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        svc.ensure_loaded()
+        print("[INFO] XLSX mapping loaded")
+    except Exception as e:
+        print(f"[WARN] startup preload failed: {e}")
+    yield
+
+
+app = FastAPI(
+    title="Structured Metadata + RAG Retrieval API",
+    version="6.0.0",
+    lifespan=lifespan,
+)
+
+
+class MetadataLookupRequest(BaseModel):
+    client: str
+    country: Optional[str] = None  # scope input
+    category: str = "finance"
+    include_manifest: bool = True
+    max_docs_per_manifest: int = 200
+
+
+class RagSearchRequest(BaseModel):
+    query: str
+    capid: Optional[str] = None
+    group_id: Optional[str] = None
+
+    # Make optional; if not provided we default to Ultimate Parent
+    country: Optional[str] = None  # US / Ultimate Parent / Corporate Family
+    category: str = "finance"
+    top_k: Optional[int] = None
+    include_manifest: bool = False
+
+
+@app.post("/api/metadata/lookup", response_model=Dict[str, Any], tags=["metadata"])
+def metadata_lookup(payload: MetadataLookupRequest):
+    client = (payload.client or "").strip()
+    if not client:
+        raise HTTPException(status_code=400, detail="client is required")
+
+    try:
+        res = svc.lookup_structured(
+            client=client,
+            country=payload.country,
+            category=payload.category,
+            include_manifest=payload.include_manifest,
+            max_docs_per_manifest=payload.max_docs_per_manifest,
+        )
+        if res.get("error"):
+            raise HTTPException(status_code=404, detail=res["error"])
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"metadata lookup failed: {e}")
+
+
+@app.post("/api/rag/search", response_model=Dict[str, Any], tags=["rag"])
+def rag_search(payload: RagSearchRequest):
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    # Default: Ultimate Parent when not provided
+    scope = (payload.country or "").strip() or "Ultimate Parent"
+
+    cap = (payload.capid or "").strip()
+    gid = (payload.group_id or "").strip()
+    if bool(cap) == bool(gid):
+        raise HTTPException(status_code=400, detail="Provide exactly one of capid OR group_id")
+
+    cat = (payload.category or "finance").strip().lower()
+    if cat not in {"finance", "legal"}:
+        cat = "finance"
+
+    try:
+        return rag.retrieve_chunks_structured(
+            query=query,
+            capid=cap if cap else None,
+            group_id=gid if gid else None,
+            scope=scope,
+            category=cat,
+            top_k=payload.top_k,
+            include_manifest=payload.include_manifest,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rag retrieval failed: {e}")
+
+
+@app.get("/health", tags=["ops"])
+def health():
+    return {"status": "ok"}
