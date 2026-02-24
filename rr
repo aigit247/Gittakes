@@ -1,0 +1,44 @@
+
+def scan_tasks() -> List[Tuple[str, str, str, List[Path]]]:
+    """
+    Returns list of tasks:
+      (category, client_folder, scope_input, files)
+    For finance: ce/finance/<client>/<scope>/
+    For legal:   ce/legal/<client>/  (scope_input="")
+    """
+    tasks: List[Tuple[str, str, str, List[Path]]] = []
+
+    # legal
+    legal_root = CATEGORY_ROOTS["legal"]
+    if legal_root.exists():
+        for client_dir in legal_root.iterdir():
+            if not client_dir.is_dir():
+                continue
+            client_folder = client_dir.name
+            files = sorted(
+                [*client_dir.rglob("*.pdf"), *client_dir.rglob("*.docx")],
+                key=lambda p: p.name.lower(),
+            )
+            if files:
+                tasks.append(("legal", client_folder, "", files))
+
+    # finance
+    fin_root = CATEGORY_ROOTS["finance"]
+    if fin_root.exists():
+        for client_dir in fin_root.iterdir():
+            if not client_dir.is_dir():
+                continue
+            client_folder = client_dir.name
+            for scope_dir in client_dir.iterdir():
+                if not scope_dir.is_dir():
+                    continue
+                scope_input = scope_dir.name  # e.g. "US", "Ultimate Parent", "Corporate Family"
+                files = sorted(
+                    [*scope_dir.rglob("*.pdf"), *scope_dir.rglob("*.docx")],
+                    key=lambda p: p.name.lower(),
+                )
+                if files:
+                    tasks.append(("finance", client_folder, scope_input, files))
+
+    return tasks
+
