@@ -1,0 +1,558 @@
+from __future__ import annotations
+
+import os
+import re
+import time
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable, Optional
+from urllib.parse import urlparse
+
+import boto3
+import fitz  # PyMuPDF
+
+from langchain.schema import Document
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import AmazonTextractPDFLoader
+from langchain_aws import BedrockEmbeddings
+
+# DOCX
+try:
+    import docx as docx_lib  # python-docx
+    _HAS_DOCX = True
+except Exception:
+    _HAS_DOCX = False
+
+# Excel
+try:
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    _HAS_OPENPYXL = True
+except Exception:
+    _HAS_OPENPYXL = False
+
+
+# ========================= CONFIG =========================
+REGION_S3 = os.environ.get("AWS_REGION_S3", os.environ.get("AWS_REGION", "us-east-1"))
+REGION_BEDROCK = os.environ.get("AWS_REGION_BEDROCK", os.environ.get("AWS_REGION", "us-east-1"))
+
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "amazon.titan-embed-text-v2:0")
+
+# Local: <LOCAL_ROOT>/<CLIENT_FOLDER>/*.(pdf|docx|xlsx|xlsm)
+LOCAL_ROOT = Path(os.environ.get("LOCAL_ROOT", "greenlight/gl_to13")).resolve()
+
+# S3: s3://bucket/ALL_PDFS/<CLIENT_FOLDER>/<same_filename>.pdf  (for scanned PDFs)
+S3_ROOT_URI = os.environ.get("S3_ROOT_URI", "s3://YOUR_BUCKET/ALL_PDFS/")
+
+# Output: <FAISS_INDEX_DIR>/<CLIENT_FOLDER>/
+FAISS_INDEX_DIR = Path(os.environ.get("FAISS_INDEX_DIR", "/opt/ml/processing/faiss_indices")).resolve()
+
+# Chunking (general text)
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1200"))
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "150"))
+
+# Scanned PDF detection
+SCAN_PAGES_TO_CHECK = int(os.environ.get("SCAN_PAGES_TO_CHECK", "3"))
+SCAN_TEXT_MIN_CHARS_PER_PAGE = int(os.environ.get("SCAN_TEXT_MIN_CHARS_PER_PAGE", "80"))
+SCAN_TOTAL_TEXT_MIN_CHARS = int(os.environ.get("SCAN_TOTAL_TEXT_MIN_CHARS", "150"))
+
+# Excel chunking
+EXCEL_ROWS_PER_CHUNK = int(os.environ.get("EXCEL_ROWS_PER_CHUNK", "40"))
+EXCEL_MAX_COLS = int(os.environ.get("EXCEL_MAX_COLS", "80"))
+EXCEL_INCLUDE_EMPTY_COLS = os.environ.get("EXCEL_INCLUDE_EMPTY_COLS", "0") == "1"
+
+# Optional mapping for client folder case mismatch:
+# export CLIENT_FOLDER_MAP_JSON='{"kpmg":"KPMG"}'
+CLIENT_FOLDER_MAP: Dict[str, str] = {}
+try:
+    raw_map = os.environ.get("CLIENT_FOLDER_MAP_JSON", "").strip()
+    if raw_map:
+        CLIENT_FOLDER_MAP = json.loads(raw_map)
+except Exception:
+    CLIENT_FOLDER_MAP = {}
+
+# If True, pass explicit textract client made from S3_SESSION into loader.
+# (Some people prefer NOT to; set 0 to use loader defaults.)
+USE_TEXTRACT_CLIENT = os.environ.get("USE_TEXTRACT_CLIENT", "0") == "1"
+
+PDF_EXTS = {".pdf"}
+DOCX_EXTS = {".docx"}
+EXCEL_EXTS = {".xlsx", ".xlsm"}
+# ==========================================================
+
+
+# ---------------------- AWS Sessions (Two Sessions) ----------------------
+
+def _make_session(prefix: str, region: str) -> boto3.Session:
+    """
+    Creates a boto3 Session using (in priority):
+      1) <PREFIX>_AWS_PROFILE
+      2) <PREFIX>_AWS_ACCESS_KEY_ID / <PREFIX>_AWS_SECRET_ACCESS_KEY / optional <PREFIX>_AWS_SESSION_TOKEN
+      3) default credential chain (SageMaker role, env AWS_ACCESS_KEY_ID, etc.)
+    """
+    profile = os.environ.get(f"{prefix}_AWS_PROFILE", "").strip()
+    if profile:
+        return boto3.Session(profile_name=profile, region_name=region)
+
+    ak = os.environ.get(f"{prefix}_AWS_ACCESS_KEY_ID", "").strip()
+    sk = os.environ.get(f"{prefix}_AWS_SECRET_ACCESS_KEY", "").strip()
+    st = os.environ.get(f"{prefix}_AWS_SESSION_TOKEN", "").strip()
+
+    if ak and sk:
+        return boto3.Session(
+            aws_access_key_id=ak,
+            aws_secret_access_key=sk,
+            aws_session_token=st or None,
+            region_name=region,
+        )
+
+    return boto3.Session(region_name=region)
+
+
+S3_SESSION = _make_session("S3", REGION_S3)
+BEDROCK_SESSION = _make_session("BEDROCK", REGION_BEDROCK)
+
+
+# ---------------------- Utilities -------------------------
+
+def clean_text(t: str) -> str:
+    t = t or ""
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    return t.strip()
+
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> List[Tuple[int, int, str]]:
+    text = text or ""
+    n = len(text)
+    if n <= chunk_size:
+        return [(0, n, text)]
+
+    out: List[Tuple[int, int, str]] = []
+    start = 0
+    while start < n:
+        end = min(n, start + chunk_size)
+        out.append((start, end, text[start:end]))
+        if end == n:
+            break
+        start = end - overlap
+        if start < 0:
+            start = 0
+    return out
+
+
+def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
+    if not s3_uri.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URI: {s3_uri}")
+    p = urlparse(s3_uri)
+    return p.netloc, p.path.lstrip("/")
+
+
+def ensure_trailing_slash(prefix: str) -> str:
+    return prefix if (not prefix or prefix.endswith("/")) else prefix + "/"
+
+
+def _apply_client_folder_mapping(rel_path_posix: str) -> str:
+    """
+    rel_path_posix looks like: "<client_folder>/file.pdf" or "<client_folder>/sub/file.pdf"
+    Replace ONLY the first folder using CLIENT_FOLDER_MAP_JSON if provided.
+    """
+    parts = rel_path_posix.split("/", 1)
+    if not parts:
+        return rel_path_posix
+    client_folder = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+
+    mapped = CLIENT_FOLDER_MAP.get(client_folder)
+    if mapped is None:
+        mapped = CLIENT_FOLDER_MAP.get(client_folder.lower())
+    if mapped:
+        return f"{mapped}/{rest}" if rest else mapped
+    return rel_path_posix
+
+
+def s3_uri_from_local_path(local_file: Path) -> str:
+    """
+    Build S3 URI preserving exact local relative path (case sensitive),
+    with optional first-folder mapping.
+    """
+    bucket, s3_prefix = parse_s3_uri(S3_ROOT_URI)
+    s3_prefix = ensure_trailing_slash(s3_prefix)
+
+    rel = local_file.relative_to(LOCAL_ROOT).as_posix()  # keeps local folder case
+    rel = _apply_client_folder_mapping(rel)
+
+    key = f"{s3_prefix}{rel}"
+    return f"s3://{bucket}/{key}"
+
+
+# ------------------- Local Scan ---------------------------
+
+def scan_local_files_by_client_folder(root: Path) -> Dict[str, List[Path]]:
+    """
+    Client id = folder name exactly (NO lowercasing).
+    Collect PDFs + DOCX + Excel workbooks.
+    """
+    out: Dict[str, List[Path]] = {}
+    for client_dir in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda x: x.name):
+        client_id = client_dir.name  # keep case
+        files: List[Path] = []
+        for ext in (PDF_EXTS | DOCX_EXTS | EXCEL_EXTS):
+            files.extend(client_dir.rglob(f"*{ext}"))
+        files = sorted(files, key=lambda x: x.name)
+        if files:
+            out[client_id] = files
+    return out
+
+
+# ---------------- PDF: scanned detection + extraction ----------------
+
+def is_scanned_pdf(local_pdf: Path) -> bool:
+    """
+    If first N pages contain almost no native text => scanned.
+    """
+    try:
+        with fitz.open(str(local_pdf)) as doc:
+            pages_to_check = min(doc.page_count, max(1, SCAN_PAGES_TO_CHECK))
+            total_chars = 0
+            any_good_page = False
+
+            for i in range(pages_to_check):
+                page = doc.load_page(i)
+                txt = clean_text(page.get_text("text") or "")
+                total_chars += len(txt)
+                if len(txt) >= SCAN_TEXT_MIN_CHARS_PER_PAGE:
+                    any_good_page = True
+
+            if any_good_page:
+                return False
+
+            return total_chars < SCAN_TOTAL_TEXT_MIN_CHARS
+    except Exception:
+        return True
+
+
+def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[Document]:
+    filename = local_pdf.name
+    with fitz.open(str(local_pdf)) as doc:
+        for pnum in range(doc.page_count):
+            page = doc.load_page(pnum)
+            text = clean_text(page.get_text("text") or "")
+            if not text:
+                continue
+
+            for _, _, chunk in chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
+                yield Document(
+                    page_content=chunk,
+                    metadata={
+                        "client_id": client_id,
+                        "file_type": "pdf",
+                        "source_name": filename,
+                        "page": pnum + 1,
+                        "local_file": str(local_pdf),
+                        "extracted_by": "pymupdf",
+                    },
+                )
+
+
+def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Path) -> Iterable[Document]:
+    """
+    Uses AmazonTextractPDFLoader on S3 URI for scanned PDFs.
+    Uses S3_SESSION credentials for textract if USE_TEXTRACT_CLIENT=1.
+    """
+    filename = local_pdf.name
+
+    if USE_TEXTRACT_CLIENT:
+        textract_client = S3_SESSION.client("textract", region_name=REGION_S3)
+        loader = AmazonTextractPDFLoader(file_path=s3_pdf_uri, client=textract_client)
+    else:
+        loader = AmazonTextractPDFLoader(file_path=s3_pdf_uri)
+
+    page_docs = loader.load()
+
+    for d in page_docs:
+        page_text = clean_text(d.page_content or "")
+        if not page_text:
+            continue
+
+        page_num = None
+        if isinstance(d.metadata, dict):
+            page_num = d.metadata.get("page") or d.metadata.get("Page")
+
+        for _, _, chunk in chunk_text(page_text, CHUNK_SIZE, CHUNK_OVERLAP):
+            meta = {
+                "client_id": client_id,
+                "file_type": "pdf",
+                "source_name": filename,
+                "source_file": s3_pdf_uri,
+                "local_file": str(local_pdf),
+                "extracted_by": "textract",
+            }
+            if page_num is not None:
+                try:
+                    meta["page"] = int(page_num)
+                except Exception:
+                    pass
+            yield Document(page_content=chunk, metadata=meta)
+
+
+# ---------------- DOCX extraction ----------------
+
+def _docx_table_to_text(table) -> str:
+    rows = []
+    for r in table.rows:
+        cells = [clean_text(c.text) for c in r.cells]
+        if any(cells):
+            rows.append(" | ".join(cells))
+    return "\n".join(rows).strip()
+
+
+def extract_docx_chunks(local_docx: Path, client_id: str) -> Iterable[Document]:
+    """
+    Extract paragraphs + tables, keep structure, chunk by characters.
+    """
+    if not _HAS_DOCX:
+        raise RuntimeError("python-docx not installed. Install it to index .docx files.")
+
+    filename = local_docx.name
+    doc = docx_lib.Document(str(local_docx))
+
+    blocks: List[str] = []
+    # paragraphs
+    for p in doc.paragraphs:
+        t = clean_text(p.text)
+        if t:
+            blocks.append(t)
+
+    # tables
+    for ti, tbl in enumerate(doc.tables):
+        tt = _docx_table_to_text(tbl)
+        if tt:
+            blocks.append(f"[TABLE {ti+1}]\n{tt}")
+
+    full_text = clean_text("\n\n".join(blocks))
+    if not full_text:
+        return
+
+    for _, _, chunk in chunk_text(full_text, CHUNK_SIZE, CHUNK_OVERLAP):
+        yield Document(
+            page_content=chunk,
+            metadata={
+                "client_id": client_id,
+                "file_type": "docx",
+                "source_name": filename,
+                "local_file": str(local_docx),
+                "extracted_by": "python-docx",
+            },
+        )
+
+
+# ---------------- Excel extraction (all sheets, context preserved) ----------------
+
+def _cell_to_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        s = str(v)
+    except Exception:
+        s = ""
+    return s.strip()
+
+
+def _find_header_row(rows: List[List[str]]) -> Tuple[int, List[str]]:
+    """
+    Find first non-empty row as header.
+    Fill missing headers with column letters.
+    """
+    for idx, r in enumerate(rows):
+        if any(c.strip() for c in r):
+            headers = r[:]
+            for j in range(len(headers)):
+                if not headers[j].strip():
+                    headers[j] = get_column_letter(j + 1)
+            return idx, headers
+    return 0, []
+
+
+def extract_excel_workbook_chunks(excel_path: Path, client_id: str) -> Iterable[Document]:
+    """
+    Reads ALL sheets. Preserves context by repeating:
+      Workbook + Sheet + Headers + Row-range
+    in each chunk.
+    """
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl not installed. Install it to index .xlsx/.xlsm files.")
+
+    filename = excel_path.name
+    wb = openpyxl.load_workbook(filename=str(excel_path), data_only=True, read_only=True)
+
+    try:
+        for ws in wb.worksheets:
+            raw_rows: List[List[str]] = []
+            for row in ws.iter_rows(values_only=True):
+                r = [_cell_to_str(v) for v in (row[:EXCEL_MAX_COLS] if row else [])]
+                raw_rows.append(r)
+
+            if not raw_rows:
+                continue
+
+            header_idx, headers = _find_header_row(raw_rows)
+            if not headers:
+                continue
+
+            data_start = header_idx + 1
+            data_rows = raw_rows[data_start:]
+
+            row_lines: List[Tuple[int, str]] = []
+            excel_row_num = data_start + 1  # 1-based
+
+            for r in data_rows:
+                r = (r + [""] * len(headers))[:len(headers)]
+                if not any(c.strip() for c in r):
+                    excel_row_num += 1
+                    continue
+
+                parts = []
+                for h, v in zip(headers, r):
+                    if v.strip() or EXCEL_INCLUDE_EMPTY_COLS:
+                        parts.append(f"{h}={v}")
+                if parts:
+                    row_lines.append((excel_row_num, " | ".join(parts)))
+
+                excel_row_num += 1
+
+            if not row_lines:
+                continue
+
+            sheet_name = ws.title
+            header_line = "Headers: " + " | ".join(headers)
+
+            i = 0
+            while i < len(row_lines):
+                chunk_rows = row_lines[i:i + EXCEL_ROWS_PER_CHUNK]
+                row_start = chunk_rows[0][0]
+                row_end = chunk_rows[-1][0]
+                body_lines = [f"Row {rn} | {txt}" for rn, txt in chunk_rows]
+
+                content = "\n".join(
+                    [
+                        f"Workbook: {filename}",
+                        f"Sheet: {sheet_name}",
+                        header_line,
+                        f"Rows: {row_start}-{row_end}",
+                        "",
+                        *body_lines,
+                    ]
+                )
+                content = clean_text(content)
+
+                # If very large, fallback to char chunking
+                if len(content) > CHUNK_SIZE * 3:
+                    for _, _, sub in chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP):
+                        yield Document(
+                            page_content=sub,
+                            metadata={
+                                "client_id": client_id,
+                                "file_type": "excel",
+                                "source_name": filename,
+                                "sheet": sheet_name,
+                                "local_file": str(excel_path),
+                                "extracted_by": "openpyxl",
+                            },
+                        )
+                else:
+                    yield Document(
+                        page_content=content,
+                        metadata={
+                            "client_id": client_id,
+                            "file_type": "excel",
+                            "source_name": filename,
+                            "sheet": sheet_name,
+                            "row_start": row_start,
+                            "row_end": row_end,
+                            "local_file": str(excel_path),
+                            "extracted_by": "openpyxl",
+                        },
+                    )
+
+                i += EXCEL_ROWS_PER_CHUNK
+    finally:
+        wb.close()
+
+
+# ---------------- Embeddings / Indexing -------------------
+
+def get_embeddings() -> BedrockEmbeddings:
+    bedrock_runtime = BEDROCK_SESSION.client("bedrock-runtime", region_name=REGION_BEDROCK)
+    return BedrockEmbeddings(model_id=EMBED_MODEL, client=bedrock_runtime)
+
+
+def index_one_client(client_id: str, local_files: List[Path], embeddings: BedrockEmbeddings) -> None:
+    client_dir = FAISS_INDEX_DIR / client_id
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    all_docs: List[Document] = []
+    t0 = time.time()
+
+    for f in local_files:
+        ext = f.suffix.lower()
+
+        if ext in PDF_EXTS:
+            scanned = is_scanned_pdf(f)
+            if scanned:
+                s3_uri = s3_uri_from_local_path(f)
+                print(f"[{client_id}] PDF scanned -> Textract: {f.name}")
+                print(f"           S3 URI: {s3_uri}")
+                for d in extract_textract_chunks(s3_uri, client_id, f):
+                    all_docs.append(d)
+            else:
+                print(f"[{client_id}] PDF native -> PyMuPDF: {f.name}")
+                for d in extract_native_pymupdf_chunks(f, client_id):
+                    all_docs.append(d)
+
+        elif ext in DOCX_EXTS:
+            print(f"[{client_id}] DOCX -> python-docx: {f.name}")
+            for d in extract_docx_chunks(f, client_id):
+                all_docs.append(d)
+
+        elif ext in EXCEL_EXTS:
+            print(f"[{client_id}] Excel -> openpyxl: {f.name}")
+            for d in extract_excel_workbook_chunks(f, client_id):
+                all_docs.append(d)
+
+        else:
+            continue
+
+    if not all_docs:
+        print(f"[{client_id}] No documents extracted. Skipping.")
+        return
+
+    print(f"[{client_id}] Building FAISS with {len(all_docs)} docs...")
+    vs = FAISS.from_documents(all_docs, embeddings)
+    vs.save_local(str(client_dir))
+
+    print(f"[{client_id}] ✅ Saved FAISS at: {client_dir} (took {time.time() - t0:.1f}s)")
+
+
+def main():
+    if not LOCAL_ROOT.exists():
+        raise SystemExit(f"LOCAL_ROOT not found: {LOCAL_ROOT}")
+
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    local_by_client = scan_local_files_by_client_folder(LOCAL_ROOT)
+    if not local_by_client:
+        print("No local client folders found.")
+        return
+
+    embeddings = get_embeddings()
+
+    for client_id, files in local_by_client.items():
+        pdf_count = sum(1 for p in files if p.suffix.lower() in PDF_EXTS)
+        docx_count = sum(1 for p in files if p.suffix.lower() in DOCX_EXTS)
+        xls_count = sum(1 for p in files if p.suffix.lower() in EXCEL_EXTS)
+        print(f"\n=== Indexing: {client_id} | PDFs={pdf_count} | DOCX={docx_count} | Excels={xls_count} ===")
+        index_one_client(client_id, files, embeddings)
+
+
+if __name__ == "__main__":
+    main()
