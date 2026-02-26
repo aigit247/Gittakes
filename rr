@@ -9,8 +9,6 @@ from typing import Dict, List, Tuple, Iterable, Optional
 from urllib.parse import urlparse
 
 import boto3
-import fitz  # PyMuPDF
-
 from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import AmazonTextractPDFLoader
@@ -32,7 +30,7 @@ except Exception:
     _HAS_OPENPYXL = False
 
 
-# ========================= CONFIG =========================
+
 REGION_S3 = os.environ.get("AWS_REGION_S3", os.environ.get("AWS_REGION", "us-east-1"))
 REGION_BEDROCK = os.environ.get("AWS_REGION_BEDROCK", os.environ.get("AWS_REGION", "us-east-1"))
 
@@ -41,27 +39,22 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "amazon.titan-embed-text-v2:0")
 # Local: <LOCAL_ROOT>/<CLIENT_FOLDER>/*.(pdf|docx|xlsx|xlsm)
 LOCAL_ROOT = Path(os.environ.get("LOCAL_ROOT", "greenlight/gl_to13")).resolve()
 
-# S3: s3://bucket/ALL_PDFS/<CLIENT_FOLDER>/<same_filename>.pdf  (for scanned PDFs)
+# S3: s3://bucket/ALL_PDFS/<CLIENT_FOLDER>/<same_filename>.pdf
 S3_ROOT_URI = os.environ.get("S3_ROOT_URI", "s3://YOUR_BUCKET/ALL_PDFS/")
 
 # Output: <FAISS_INDEX_DIR>/<CLIENT_FOLDER>/
 FAISS_INDEX_DIR = Path(os.environ.get("FAISS_INDEX_DIR", "/opt/ml/processing/faiss_indices")).resolve()
 
-# Chunking (general text)
+# Chunking (characters)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "150"))
 
-# Scanned PDF detection
-SCAN_PAGES_TO_CHECK = int(os.environ.get("SCAN_PAGES_TO_CHECK", "3"))
-SCAN_TEXT_MIN_CHARS_PER_PAGE = int(os.environ.get("SCAN_TEXT_MIN_CHARS_PER_PAGE", "80"))
-SCAN_TOTAL_TEXT_MIN_CHARS = int(os.environ.get("SCAN_TOTAL_TEXT_MIN_CHARS", "150"))
-
-# Excel chunking
+# Excel chunking (rows)
 EXCEL_ROWS_PER_CHUNK = int(os.environ.get("EXCEL_ROWS_PER_CHUNK", "40"))
 EXCEL_MAX_COLS = int(os.environ.get("EXCEL_MAX_COLS", "80"))
 EXCEL_INCLUDE_EMPTY_COLS = os.environ.get("EXCEL_INCLUDE_EMPTY_COLS", "0") == "1"
 
-# Optional mapping for client folder case mismatch:
+# Optional mapping for local client folder -> S3 client folder case mismatch:
 # export CLIENT_FOLDER_MAP_JSON='{"kpmg":"KPMG"}'
 CLIENT_FOLDER_MAP: Dict[str, str] = {}
 try:
@@ -71,25 +64,17 @@ try:
 except Exception:
     CLIENT_FOLDER_MAP = {}
 
-# If True, pass explicit textract client made from S3_SESSION into loader.
-# (Some people prefer NOT to; set 0 to use loader defaults.)
+# If True, pass an explicit textract client created from S3_SESSION into loader.
+# Default 0 uses AmazonTextractPDFLoader(s3_uri) directly (like your manual test).
 USE_TEXTRACT_CLIENT = os.environ.get("USE_TEXTRACT_CLIENT", "0") == "1"
 
 PDF_EXTS = {".pdf"}
 DOCX_EXTS = {".docx"}
 EXCEL_EXTS = {".xlsx", ".xlsm"}
-# ==========================================================
 
-
-# ---------------------- AWS Sessions (Two Sessions) ----------------------
 
 def _make_session(prefix: str, region: str) -> boto3.Session:
-    """
-    Creates a boto3 Session using (in priority):
-      1) <PREFIX>_AWS_PROFILE
-      2) <PREFIX>_AWS_ACCESS_KEY_ID / <PREFIX>_AWS_SECRET_ACCESS_KEY / optional <PREFIX>_AWS_SESSION_TOKEN
-      3) default credential chain (SageMaker role, env AWS_ACCESS_KEY_ID, etc.)
-    """
+    
     profile = os.environ.get(f"{prefix}_AWS_PROFILE", "").strip()
     if profile:
         return boto3.Session(profile_name=profile, region_name=region)
@@ -152,10 +137,7 @@ def ensure_trailing_slash(prefix: str) -> str:
 
 
 def _apply_client_folder_mapping(rel_path_posix: str) -> str:
-    """
-    rel_path_posix looks like: "<client_folder>/file.pdf" or "<client_folder>/sub/file.pdf"
-    Replace ONLY the first folder using CLIENT_FOLDER_MAP_JSON if provided.
-    """
+    
     parts = rel_path_posix.split("/", 1)
     if not parts:
         return rel_path_posix
@@ -171,30 +153,23 @@ def _apply_client_folder_mapping(rel_path_posix: str) -> str:
 
 
 def s3_uri_from_local_path(local_file: Path) -> str:
-    """
-    Build S3 URI preserving exact local relative path (case sensitive),
-    with optional first-folder mapping.
-    """
+    
     bucket, s3_prefix = parse_s3_uri(S3_ROOT_URI)
     s3_prefix = ensure_trailing_slash(s3_prefix)
 
     rel = local_file.relative_to(LOCAL_ROOT).as_posix()  # keeps local folder case
-    rel = _apply_client_folder_mapping(rel)
+    rel = _apply_client_folder_mapping(rel)              # optional fix for S3 case
 
     key = f"{s3_prefix}{rel}"
     return f"s3://{bucket}/{key}"
 
 
-# ------------------- Local Scan ---------------------------
 
 def scan_local_files_by_client_folder(root: Path) -> Dict[str, List[Path]]:
-    """
-    Client id = folder name exactly (NO lowercasing).
-    Collect PDFs + DOCX + Excel workbooks.
-    """
+    
     out: Dict[str, List[Path]] = {}
     for client_dir in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda x: x.name):
-        client_id = client_dir.name  # keep case
+        client_id = client_dir.name  # keep case for FAISS folder names
         files: List[Path] = []
         for ext in (PDF_EXTS | DOCX_EXTS | EXCEL_EXTS):
             files.extend(client_dir.rglob(f"*{ext}"))
@@ -204,61 +179,10 @@ def scan_local_files_by_client_folder(root: Path) -> Dict[str, List[Path]]:
     return out
 
 
-# ---------------- PDF: scanned detection + extraction ----------------
-
-def is_scanned_pdf(local_pdf: Path) -> bool:
-    """
-    If first N pages contain almost no native text => scanned.
-    """
-    try:
-        with fitz.open(str(local_pdf)) as doc:
-            pages_to_check = min(doc.page_count, max(1, SCAN_PAGES_TO_CHECK))
-            total_chars = 0
-            any_good_page = False
-
-            for i in range(pages_to_check):
-                page = doc.load_page(i)
-                txt = clean_text(page.get_text("text") or "")
-                total_chars += len(txt)
-                if len(txt) >= SCAN_TEXT_MIN_CHARS_PER_PAGE:
-                    any_good_page = True
-
-            if any_good_page:
-                return False
-
-            return total_chars < SCAN_TOTAL_TEXT_MIN_CHARS
-    except Exception:
-        return True
 
 
-def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[Document]:
-    filename = local_pdf.name
-    with fitz.open(str(local_pdf)) as doc:
-        for pnum in range(doc.page_count):
-            page = doc.load_page(pnum)
-            text = clean_text(page.get_text("text") or "")
-            if not text:
-                continue
-
-            for _, _, chunk in chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
-                yield Document(
-                    page_content=chunk,
-                    metadata={
-                        "client_id": client_id,
-                        "file_type": "pdf",
-                        "source_name": filename,
-                        "page": pnum + 1,
-                        "local_file": str(local_pdf),
-                        "extracted_by": "pymupdf",
-                    },
-                )
-
-
-def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Path) -> Iterable[Document]:
-    """
-    Uses AmazonTextractPDFLoader on S3 URI for scanned PDFs.
-    Uses S3_SESSION credentials for textract if USE_TEXTRACT_CLIENT=1.
-    """
+def extract_textract_pdf_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Path) -> Iterable[Document]:
+    
     filename = local_pdf.name
 
     if USE_TEXTRACT_CLIENT:
@@ -295,7 +219,7 @@ def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Path) ->
             yield Document(page_content=chunk, metadata=meta)
 
 
-# ---------------- DOCX extraction ----------------
+
 
 def _docx_table_to_text(table) -> str:
     rows = []
@@ -307,9 +231,7 @@ def _docx_table_to_text(table) -> str:
 
 
 def extract_docx_chunks(local_docx: Path, client_id: str) -> Iterable[Document]:
-    """
-    Extract paragraphs + tables, keep structure, chunk by characters.
-    """
+    
     if not _HAS_DOCX:
         raise RuntimeError("python-docx not installed. Install it to index .docx files.")
 
@@ -317,13 +239,11 @@ def extract_docx_chunks(local_docx: Path, client_id: str) -> Iterable[Document]:
     doc = docx_lib.Document(str(local_docx))
 
     blocks: List[str] = []
-    # paragraphs
     for p in doc.paragraphs:
         t = clean_text(p.text)
         if t:
             blocks.append(t)
 
-    # tables
     for ti, tbl in enumerate(doc.tables):
         tt = _docx_table_to_text(tbl)
         if tt:
@@ -346,7 +266,7 @@ def extract_docx_chunks(local_docx: Path, client_id: str) -> Iterable[Document]:
         )
 
 
-# ---------------- Excel extraction (all sheets, context preserved) ----------------
+
 
 def _cell_to_str(v) -> str:
     if v is None:
@@ -374,11 +294,7 @@ def _find_header_row(rows: List[List[str]]) -> Tuple[int, List[str]]:
 
 
 def extract_excel_workbook_chunks(excel_path: Path, client_id: str) -> Iterable[Document]:
-    """
-    Reads ALL sheets. Preserves context by repeating:
-      Workbook + Sheet + Headers + Row-range
-    in each chunk.
-    """
+    
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl not installed. Install it to index .xlsx/.xlsm files.")
 
@@ -479,7 +395,6 @@ def extract_excel_workbook_chunks(excel_path: Path, client_id: str) -> Iterable[
         wb.close()
 
 
-# ---------------- Embeddings / Indexing -------------------
 
 def get_embeddings() -> BedrockEmbeddings:
     bedrock_runtime = BEDROCK_SESSION.client("bedrock-runtime", region_name=REGION_BEDROCK)
@@ -487,6 +402,7 @@ def get_embeddings() -> BedrockEmbeddings:
 
 
 def index_one_client(client_id: str, local_files: List[Path], embeddings: BedrockEmbeddings) -> None:
+    
     client_dir = FAISS_INDEX_DIR / client_id
     client_dir.mkdir(parents=True, exist_ok=True)
 
@@ -497,17 +413,15 @@ def index_one_client(client_id: str, local_files: List[Path], embeddings: Bedroc
         ext = f.suffix.lower()
 
         if ext in PDF_EXTS:
-            scanned = is_scanned_pdf(f)
-            if scanned:
-                s3_uri = s3_uri_from_local_path(f)
-                print(f"[{client_id}] PDF scanned -> Textract: {f.name}")
-                print(f"           S3 URI: {s3_uri}")
-                for d in extract_textract_chunks(s3_uri, client_id, f):
+            s3_uri = s3_uri_from_local_path(f)
+            print(f"[{client_id}] PDF -> Textract (ALL PDFs): {f.name}")
+            print(f"           S3 URI: {s3_uri}")
+            try:
+                for d in extract_textract_pdf_chunks(s3_uri, client_id, f):
                     all_docs.append(d)
-            else:
-                print(f"[{client_id}] PDF native -> PyMuPDF: {f.name}")
-                for d in extract_native_pymupdf_chunks(f, client_id):
-                    all_docs.append(d)
+            except Exception as e:
+                print(f"[WARN] Textract failed for {s3_uri}: {e}")
+                # No PyMuPDF fallback (as requested). We just skip this PDF.
 
         elif ext in DOCX_EXTS:
             print(f"[{client_id}] DOCX -> python-docx: {f.name}")
@@ -530,7 +444,7 @@ def index_one_client(client_id: str, local_files: List[Path], embeddings: Bedroc
     vs = FAISS.from_documents(all_docs, embeddings)
     vs.save_local(str(client_dir))
 
-    print(f"[{client_id}] ✅ Saved FAISS at: {client_dir} (took {time.time() - t0:.1f}s)")
+    print(f"[{client_id}]  Saved FAISS at: {client_dir} (took {time.time() - t0:.1f}s)")
 
 
 def main():
